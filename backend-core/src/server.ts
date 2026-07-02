@@ -3,6 +3,8 @@ import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
 import {
   applyYield,
+  consumeClaimSession,
+  createClaimSession,
   DuplicateTransactionError,
   getBalance,
   getTransactions,
@@ -28,6 +30,11 @@ interface YieldRequestBody {
   amount?: unknown;
   layer?: unknown;
   nonce?: unknown;
+  sessionToken?: unknown;
+}
+
+interface SessionStartRequestBody {
+  userId?: unknown;
 }
 
 interface YieldTransaction {
@@ -35,6 +42,7 @@ interface YieldTransaction {
   amount: number;
   layer: YieldLayer;
   nonce: string;
+  sessionToken: string;
   timestamp: string;
 }
 
@@ -52,9 +60,9 @@ app.use(
 
 app.use(express.json({ limit: "16kb" }));
 
-function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
+function parseUserId(userIdValue: unknown): string {
   const userId =
-    typeof body.userId === "string" ? body.userId.trim() : "";
+    typeof userIdValue === "string" ? userIdValue.trim() : "";
 
   if (!userId) {
     throw new ValidationError("userId is required and must be a non-empty string.");
@@ -63,6 +71,12 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
   if (userId.length > 128) {
     throw new ValidationError("userId must be 128 characters or fewer.");
   }
+
+  return userId;
+}
+
+function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
+  const userId = parseUserId(body.userId);
 
   const amount =
     typeof body.amount === "number"
@@ -99,11 +113,21 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
     throw new ValidationError("nonce must be 128 characters or fewer.");
   }
 
+  const sessionToken =
+    typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
+
+  if (!sessionToken) {
+    throw new ValidationError(
+      "sessionToken is required and must be a non-empty string.",
+    );
+  }
+
   return {
     userId,
     amount: Math.round(amount * 100) / 100,
     layer: layer as YieldLayer,
     nonce,
+    sessionToken,
     timestamp: new Date().toISOString(),
   };
 }
@@ -123,9 +147,58 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+app.post("/api/v1/session/start", (req: Request, res: Response) => {
+  try {
+    const userId = parseUserId((req.body as SessionStartRequestBody).userId);
+    const sessionToken = createClaimSession(userId);
+
+    res.status(200).json({
+      success: true,
+      data: { sessionToken },
+    });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Session] Unexpected error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 app.post("/api/v1/yield", (req: Request, res: Response) => {
   try {
     const transaction = parseYieldRequest(req.body as YieldRequestBody);
+
+    const sessionResult = consumeClaimSession(
+      transaction.sessionToken,
+      transaction.userId,
+      5,
+    );
+
+    if (!sessionResult.ok) {
+      if (sessionResult.reason === "invalid") {
+        res.status(403).json({
+          success: false,
+          message: "Invalid or already used session.",
+        });
+        return;
+      }
+
+      res.status(403).json({
+        success: false,
+        message: "Wait period not satisfied.",
+      });
+      return;
+    }
+
     const previousBalance = getBalance(transaction.userId);
     const updatedBalance = applyYield({
       userId: transaction.userId,
@@ -162,8 +235,9 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
     }
 
     if (error instanceof DuplicateTransactionError) {
-      res.status(409).json({
-        success: false,
+      res.status(200).json({
+        success: true,
+        duplicate: true,
         message: error.message,
       });
       return;

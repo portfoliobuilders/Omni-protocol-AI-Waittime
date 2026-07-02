@@ -2,6 +2,7 @@ const EARNINGS_KEY = "omniEarnings";
 const BEHAVIORAL_LAYER_KEY = "behavioralLayer";
 const DIVIDEND_AMOUNT = 0.1;
 const YIELD_API_URL = "http://localhost:3001/api/v1/yield";
+const SESSION_START_API_URL = "http://localhost:3001/api/v1/session/start";
 const USER_ID = "user-001";
 const YIELD_LAYER = "behavioralLayer";
 const BOX_ID = "omni-piggy-mindful-break";
@@ -20,6 +21,7 @@ let isGenerating = false;
 let boxMounted = false;
 let claimedThisCycle = false;
 let isClaiming = false;
+let currentSessionToken: string | null = null;
 
 function isExtensionContextValid(): boolean {
   try {
@@ -235,8 +237,42 @@ function setupBehavioralLayerListener(): void {
   }
 }
 
+function clearSessionToken(): void {
+  currentSessionToken = null;
+}
+
+async function requestSessionToken(): Promise<void> {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const response = await fetch(SESSION_START_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: USER_ID }),
+    });
+
+    if (!response.ok) return;
+
+    const payload = (await response.json()) as {
+      success?: boolean;
+      data?: { sessionToken?: string };
+    };
+
+    if (!payload.success || !payload.data?.sessionToken) return;
+
+    currentSessionToken = payload.data.sessionToken;
+
+    if (isGenerating && !claimedThisCycle) {
+      void showMindfulBreakBox();
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function showMindfulBreakBox(): Promise<void> {
   if (boxMounted || claimedThisCycle || isClaiming) return;
+  if (!currentSessionToken) return;
 
   const enabled = await isBehavioralLayerEnabled();
   if (!enabled) return;
@@ -284,6 +320,7 @@ async function handleClaim(
         amount: 0.1,
         layer: YIELD_LAYER,
         nonce: crypto.randomUUID(),
+        sessionToken: currentSessionToken,
       }),
       signal: controller.signal,
     });
@@ -328,6 +365,7 @@ async function handleClaim(
     `;
 
     claimedThisCycle = true;
+    clearSessionToken();
 
     window.setTimeout(() => {
       box.classList.add("omni-slide-out");
@@ -358,6 +396,11 @@ function evaluateWaitState(): void {
 
   if (active && !isGenerating) {
     claimedThisCycle = false;
+    void requestSessionToken();
+  }
+
+  if (isGenerating && !active && !claimedThisCycle) {
+    clearSessionToken();
   }
 
   isGenerating = active;

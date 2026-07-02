@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import crypto from "node:crypto";
 import path from "node:path";
 
 const DB_PATH = path.join(process.cwd(), "omni-ledger.db");
@@ -26,6 +27,14 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_tx_user_created
     ON transactions (user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS claim_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT UNIQUE NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    used INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
 export interface TransactionRow {
@@ -100,3 +109,64 @@ export function getBalance(userId: string): number {
 export function getTransactions(userId: string, limit = 25): TransactionRow[] {
   return selectTransactions.all(userId, limit) as TransactionRow[];
 }
+
+interface ClaimSessionRow {
+  id: number;
+  token: string;
+  user_id: string;
+  created_at: string;
+  used: number;
+}
+
+const insertClaimSession = db.prepare(`
+  INSERT INTO claim_sessions (token, user_id)
+  VALUES (?, ?)
+`);
+
+const selectClaimSession = db.prepare(`
+  SELECT id, token, user_id, created_at, used
+  FROM claim_sessions
+  WHERE token = ?
+`);
+
+const markClaimSessionUsed = db.prepare(`
+  UPDATE claim_sessions SET used = 1 WHERE token = ?
+`);
+
+export type ConsumeClaimSessionResult =
+  | { ok: true }
+  | { ok: false; reason: "invalid" | "too_fast" };
+
+export function createClaimSession(userId: string): string {
+  const token = crypto.randomUUID();
+  insertClaimSession.run(token, userId);
+  return token;
+}
+
+export const consumeClaimSession = db.transaction(
+  (
+    token: string,
+    userId: string,
+    minWaitSeconds: number,
+  ): ConsumeClaimSessionResult => {
+    const row = selectClaimSession.get(token) as ClaimSessionRow | undefined;
+
+    if (!row || row.used === 1 || row.user_id !== userId) {
+      return { ok: false, reason: "invalid" };
+    }
+
+    const createdAtIso = row.created_at.includes("T")
+      ? row.created_at.endsWith("Z")
+        ? row.created_at
+        : `${row.created_at}Z`
+      : `${row.created_at.replace(" ", "T")}Z`;
+    const elapsedSeconds = (Date.now() - Date.parse(createdAtIso)) / 1000;
+
+    if (elapsedSeconds < minWaitSeconds) {
+      return { ok: false, reason: "too_fast" };
+    }
+
+    markClaimSessionUsed.run(token);
+    return { ok: true };
+  },
+);
