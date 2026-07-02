@@ -7,8 +7,6 @@ const STORAGE_KEYS = {
   passiveDepinLayer: "passiveDepinLayer",
 } as const;
 
-const API_BASE = "http://localhost:3001/api/v1";
-const HEALTH_URL = "http://localhost:3001/health";
 const USER_ID = "user-001";
 
 type LayerKey =
@@ -30,6 +28,19 @@ interface Transaction {
   nonce: string;
   created_at: string;
 }
+
+interface WalletData {
+  balance: number;
+  transactions: Transaction[];
+}
+
+type BackgroundMessage =
+  | { type: "GET_WALLET"; payload: { userId: string; limit: number } }
+  | { type: "GET_HEALTH" };
+
+type BackgroundResponse =
+  | { ok: true; data: unknown; status?: number }
+  | { ok: false; error: string; status?: number };
 
 const LAYER_LABELS: Record<string, string> = {
   activeAiLayer: "Active AI Layer",
@@ -81,32 +92,38 @@ function formatRelativeTime(createdAt: string): string {
   return `${diffDay}d ago`;
 }
 
-function parseBalanceResponse(json: unknown): number | null {
-  if (typeof json === "object" && json !== null) {
-    const obj = json as Record<string, unknown>;
-    if (typeof obj.balance === "number") return obj.balance;
-    if (typeof obj.data === "object" && obj.data !== null) {
-      const data = obj.data as Record<string, unknown>;
-      if (typeof data.balance === "number") return data.balance;
+function sendBackgroundMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(message, (response: BackgroundResponse | undefined) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        if (!response) {
+          reject(new Error("No background response"));
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      reject(error);
     }
-  }
-  return null;
+  });
 }
 
-function parseTransactionsResponse(json: unknown): Transaction[] | null {
-  if (Array.isArray(json)) return json as Transaction[];
-  if (typeof json === "object" && json !== null) {
-    const obj = json as Record<string, unknown>;
-    if (Array.isArray(obj.data)) return obj.data as Transaction[];
-    if (Array.isArray(obj.transactions)) return obj.transactions as Transaction[];
-    if (typeof obj.data === "object" && obj.data !== null) {
-      const data = obj.data as Record<string, unknown>;
-      if (Array.isArray(data.transactions)) {
-        return data.transactions as Transaction[];
-      }
-    }
-  }
-  return null;
+function parseWalletData(data: unknown): WalletData | null {
+  if (typeof data !== "object" || data === null) return null;
+
+  const wallet = data as Record<string, unknown>;
+  if (typeof wallet.balance !== "number") return null;
+  if (!Array.isArray(wallet.transactions)) return null;
+
+  return {
+    balance: wallet.balance,
+    transactions: wallet.transactions as Transaction[],
+  };
 }
 
 function ToggleSwitch({
@@ -191,47 +208,45 @@ export default function App() {
 
     void (async () => {
       let bankKnownOnline = false;
+      setTransactionsLoading(true);
+      setTransactionsOffline(false);
+
       try {
-        const res = await fetch(`${API_BASE}/balance/${USER_ID}`);
-        if (!res.ok) throw new Error(`Balance API responded with ${res.status}`);
-        const balance = parseBalanceResponse(await res.json());
-        if (balance === null) throw new Error("Unexpected balance response shape");
-        setEarnings(balance);
+        const walletResponse = await sendBackgroundMessage({
+          type: "GET_WALLET",
+          payload: { userId: USER_ID, limit: 10 },
+        });
+        if (!walletResponse.ok) {
+          throw new Error(
+            walletResponse.status
+              ? `Wallet API responded with ${walletResponse.status}`
+              : walletResponse.error,
+          );
+        }
+
+        const wallet = parseWalletData(walletResponse.data);
+        if (wallet === null) throw new Error("Unexpected wallet response shape");
+
+        setEarnings(wallet.balance);
         setBalanceSource("api");
+        setTransactions(wallet.transactions);
+        setTransactionsOffline(false);
         setBankOnline(true);
         bankKnownOnline = true;
       } catch {
         setBalanceSource("local");
+        setTransactionsOffline(true);
+      } finally {
+        setTransactionsLoading(false);
       }
 
       if (!bankKnownOnline) {
         try {
-          const controller = new AbortController();
-          const timeoutId = window.setTimeout(() => controller.abort(), 3000);
-          const healthRes = await fetch(HEALTH_URL, { signal: controller.signal });
-          window.clearTimeout(timeoutId);
-          setBankOnline(healthRes.ok);
+          const healthResponse = await sendBackgroundMessage({ type: "GET_HEALTH" });
+          setBankOnline(healthResponse.ok);
         } catch {
           setBankOnline(false);
         }
-      }
-    })();
-
-    void (async () => {
-      setTransactionsLoading(true);
-      setTransactionsOffline(false);
-      try {
-        const res = await fetch(
-          `${API_BASE}/transactions/${USER_ID}?limit=10`,
-        );
-        if (!res.ok) throw new Error(`Transactions API responded with ${res.status}`);
-        const parsed = parseTransactionsResponse(await res.json());
-        if (parsed === null) throw new Error("Unexpected transactions response shape");
-        setTransactions(parsed);
-      } catch {
-        setTransactionsOffline(true);
-      } finally {
-        setTransactionsLoading(false);
       }
     })();
 

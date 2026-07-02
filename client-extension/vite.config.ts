@@ -5,15 +5,15 @@ import { build, defineConfig, type Plugin, type UserConfig } from "vite";
 const rootDir = __dirname;
 const outDir = resolve(rootDir, "dist");
 
-function buildContentScript(): Plugin {
-  let hasBuiltContent = false;
+function buildExtensionScripts(): Plugin {
+  let hasBuiltScripts = false;
 
   return {
-    name: "omni-piggy:build-content-script",
+    name: "omni-piggy:build-extension-scripts",
     apply: "build",
     async closeBundle() {
-      if (hasBuiltContent) return;
-      hasBuiltContent = true;
+      if (hasBuiltScripts) return;
+      hasBuiltScripts = true;
 
       const contentConfig: UserConfig = {
         publicDir: false,
@@ -37,8 +37,32 @@ function buildContentScript(): Plugin {
         },
       };
 
+      const backgroundConfig: UserConfig = {
+        publicDir: false,
+        build: {
+          outDir,
+          emptyOutDir: false,
+          target: "esnext",
+          sourcemap: true,
+          lib: {
+            entry: resolve(rootDir, "src/background/worker.ts"),
+            formats: ["es"],
+            fileName: () => "background/worker.js",
+          },
+          rollupOptions: {
+            output: {
+              inlineDynamicImports: true,
+            },
+          },
+        },
+      };
+
       await build({
         ...contentConfig,
+        configFile: false,
+      });
+      await build({
+        ...backgroundConfig,
         configFile: false,
       });
     },
@@ -46,7 +70,7 @@ function buildContentScript(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), buildContentScript()],
+  plugins: [react(), buildExtensionScripts()],
   publicDir: resolve(rootDir, "public"),
   build: {
     outDir,

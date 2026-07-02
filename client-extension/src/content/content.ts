@@ -1,8 +1,8 @@
-const EARNINGS_KEY = "omniEarnings";
 const BEHAVIORAL_LAYER_KEY = "behavioralLayer";
-const DIVIDEND_AMOUNT = 0.1;
-const YIELD_API_URL = "http://localhost:3001/api/v1/yield";
-const SESSION_START_API_URL = "http://localhost:3001/api/v1/session/start";
+const AMOUNT_TIER2 = 0.1;
+const AMOUNT_TIER3 = 0.25;
+const TIER1_MAX_SEC = 4;
+const TIER2_MAX_SEC = 14;
 const USER_ID = "user-001";
 const YIELD_LAYER = "behavioralLayer";
 const BOX_ID = "omni-piggy-mindful-break";
@@ -22,6 +22,25 @@ let boxMounted = false;
 let claimedThisCycle = false;
 let isClaiming = false;
 let currentSessionToken: string | null = null;
+let generationStartedAt: number | null = null;
+let waitTimerInterval: number | null = null;
+
+type BackgroundMessage =
+  | { type: "SESSION_START"; payload: { userId: string } }
+  | {
+      type: "CLAIM_YIELD";
+      payload: {
+        userId: string;
+        amount: number;
+        layer: string;
+        nonce: string;
+        sessionToken: string | null;
+      };
+    };
+
+type BackgroundResponse =
+  | { ok: true; data: unknown; status?: number }
+  | { ok: false; error: string; status?: number };
 
 function isExtensionContextValid(): boolean {
   try {
@@ -40,7 +59,90 @@ function stopExtensionScript(): void {
     cancelAnimationFrame(rafHandle);
     rafHandle = 0;
   }
+  clearWaitTimer();
   removeBox();
+}
+
+type WaitTier = 1 | 2 | 3;
+
+function getElapsedSeconds(): number {
+  if (generationStartedAt === null) return 0;
+  return Math.floor((Date.now() - generationStartedAt) / 1000);
+}
+
+function getWaitTier(elapsedSec: number): WaitTier {
+  if (elapsedSec <= TIER1_MAX_SEC) return 1;
+  if (elapsedSec <= TIER2_MAX_SEC) return 2;
+  return 3;
+}
+
+function getClaimAmount(tier: WaitTier): number {
+  return tier >= 3 ? AMOUNT_TIER3 : AMOUNT_TIER2;
+}
+
+function formatClaimAmount(amount: number): string {
+  return amount.toFixed(2);
+}
+
+function clearWaitTimer(): void {
+  if (waitTimerInterval !== null) {
+    clearInterval(waitTimerInterval);
+    waitTimerInterval = null;
+  }
+}
+
+function startWaitTimer(): void {
+  clearWaitTimer();
+  waitTimerInterval = window.setInterval(() => {
+    if (!isExtensionContextValid()) {
+      stopExtensionScript();
+      return;
+    }
+    if (claimedThisCycle || isClaiming || !isGenerating) {
+      clearWaitTimer();
+      return;
+    }
+    if (boxMounted) {
+      updateBoxTier();
+    }
+  }, 1000);
+}
+
+function updateBoxTier(): void {
+  const box = document.getElementById(BOX_ID);
+  if (!box || isClaiming || claimedThisCycle) return;
+
+  const title = box.querySelector<HTMLElement>(".omni-title");
+  const body = box.querySelector<HTMLElement>(".omni-body");
+  const counter = box.querySelector<HTMLElement>(".omni-counter");
+  const button = box.querySelector<HTMLButtonElement>(".omni-claim-btn");
+  if (!title || !body || !counter || !button) return;
+
+  const elapsed = getElapsedSeconds();
+  const tier = getWaitTier(elapsed);
+
+  if (tier === 1) {
+    title.textContent = "🧘 Mindful Break";
+    body.textContent = "Your AI is thinking — take a breath.";
+    body.hidden = false;
+    counter.textContent = `${elapsed}s`;
+    counter.hidden = false;
+    button.hidden = true;
+    return;
+  }
+
+  body.hidden = true;
+  counter.hidden = true;
+  button.hidden = false;
+
+  if (tier === 2) {
+    title.textContent = "🧘 Mindful Break";
+    button.textContent = "Claim $0.10 Dividend";
+    return;
+  }
+
+  title.textContent = "💎 Deep Work Bonus";
+  button.textContent = "Claim $0.25 Dividend";
 }
 
 function injectStyles(): void {
@@ -85,6 +187,21 @@ function injectStyles(): void {
       font-weight: 600;
       letter-spacing: 0.01em;
       color: #ffffff;
+    }
+
+    #${BOX_ID} .omni-body {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.45;
+      color: #a1a1aa;
+    }
+
+    #${BOX_ID} .omni-counter {
+      margin: 0 0 14px;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      color: #71717a;
     }
 
     #${BOX_ID} .omni-claim-btn {
@@ -201,6 +318,7 @@ function removeBox(): void {
     existing.remove();
   }
   boxMounted = false;
+  clearWaitTimer();
 }
 
 function isBehavioralLayerEnabled(): Promise<boolean> {
@@ -241,19 +359,43 @@ function clearSessionToken(): void {
   currentSessionToken = null;
 }
 
+function sendBackgroundMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
+  if (!isExtensionContextValid()) {
+    return Promise.reject(new Error("Extension context invalidated"));
+  }
+
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(message, (response: BackgroundResponse | undefined) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        if (!response) {
+          reject(new Error("No background response"));
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 async function requestSessionToken(): Promise<void> {
   if (!isExtensionContextValid()) return;
 
   try {
-    const response = await fetch(SESSION_START_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId: USER_ID }),
+    const response = await sendBackgroundMessage({
+      type: "SESSION_START",
+      payload: { userId: USER_ID },
     });
 
     if (!response.ok) return;
 
-    const payload = (await response.json()) as {
+    const payload = response.data as {
       success?: boolean;
       data?: { sessionToken?: string };
     };
@@ -287,17 +429,26 @@ async function showMindfulBreakBox(): Promise<void> {
 
   const title = document.createElement("p");
   title.className = "omni-title";
-  title.textContent = "🧘 Mindful Break";
+
+  const body = document.createElement("p");
+  body.className = "omni-body";
+
+  const counter = document.createElement("p");
+  counter.className = "omni-counter";
 
   const button = document.createElement("button");
   button.type = "button";
   button.className = "omni-claim-btn";
-  button.textContent = "Claim $0.10 Dividend";
+  button.hidden = true;
   button.addEventListener("click", () => void handleClaim(box, button));
 
-  box.append(title, button);
+  box.append(title, body, counter, button);
   document.body.appendChild(box);
   boxMounted = true;
+  updateBoxTier();
+  if (waitTimerInterval === null) {
+    startWaitTimer();
+  }
 }
 
 async function handleClaim(
@@ -308,63 +459,38 @@ async function handleClaim(
   isClaiming = true;
   button.disabled = true;
 
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+  const claimAmount = getClaimAmount(getWaitTier(getElapsedSeconds()));
 
   try {
-    const response = await fetch(YIELD_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const response = await sendBackgroundMessage({
+      type: "CLAIM_YIELD",
+      payload: {
         userId: USER_ID,
-        amount: 0.1,
+        amount: claimAmount,
         layer: YIELD_LAYER,
         nonce: crypto.randomUUID(),
         sessionToken: currentSessionToken,
-      }),
-      signal: controller.signal,
+      },
     });
 
     if (!response.ok) {
-      throw new Error(`Yield API responded with ${response.status}`);
+      throw new Error(
+        response.status
+          ? `Yield API responded with ${response.status}`
+          : response.error,
+      );
     }
-
-    const current = await new Promise<number>((resolve) => {
-      if (!isExtensionContextValid()) {
-        resolve(0);
-        return;
-      }
-      try {
-        chrome.storage.local.get([EARNINGS_KEY], (result) => {
-          resolve(Number(result[EARNINGS_KEY] ?? 0));
-        });
-      } catch {
-        resolve(0);
-      }
-    });
-    const next = Math.round((current + DIVIDEND_AMOUNT) * 100) / 100;
-
-    await new Promise<void>((resolve) => {
-      if (!isExtensionContextValid()) {
-        resolve();
-        return;
-      }
-      try {
-        chrome.storage.local.set({ [EARNINGS_KEY]: next }, () => resolve());
-      } catch {
-        resolve();
-      }
-    });
 
     button.classList.add("omni-claimed");
     button.innerHTML = `
       <span class="omni-check">
         <span class="omni-check-icon" aria-hidden="true"></span>
-        Claimed $0.10
+        Claimed $${formatClaimAmount(claimAmount)}
       </span>
     `;
 
     claimedThisCycle = true;
+    clearWaitTimer();
     clearSessionToken();
 
     window.setTimeout(() => {
@@ -379,8 +505,6 @@ async function handleClaim(
     button.textContent = "Bank offline — Retry";
     button.disabled = false;
     isClaiming = false;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -396,11 +520,15 @@ function evaluateWaitState(): void {
 
   if (active && !isGenerating) {
     claimedThisCycle = false;
+    generationStartedAt = Date.now();
+    startWaitTimer();
     void requestSessionToken();
   }
 
   if (isGenerating && !active && !claimedThisCycle) {
     clearSessionToken();
+    clearWaitTimer();
+    generationStartedAt = null;
   }
 
   isGenerating = active;
