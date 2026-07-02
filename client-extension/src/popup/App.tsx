@@ -1,0 +1,342 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+const STORAGE_KEYS = {
+  earnings: "omniEarnings",
+  activeAiLayer: "activeAiLayer",
+  behavioralLayer: "behavioralLayer",
+  passiveDepinLayer: "passiveDepinLayer",
+} as const;
+
+const API_BASE = "http://localhost:3001/api/v1";
+const USER_ID = "user-001";
+
+type LayerKey =
+  | typeof STORAGE_KEYS.activeAiLayer
+  | typeof STORAGE_KEYS.behavioralLayer
+  | typeof STORAGE_KEYS.passiveDepinLayer;
+
+interface LayerToggle {
+  key: LayerKey;
+  label: string;
+  description: string;
+}
+
+interface Transaction {
+  id: number;
+  user_id: string;
+  amount: number;
+  layer: string;
+  nonce: string;
+  created_at: string;
+}
+
+const LAYER_LABELS: Record<string, string> = {
+  activeAiLayer: "Active AI Layer",
+  behavioralLayer: "Behavioral Layer",
+  passiveDepinLayer: "Passive DePIN Layer",
+};
+
+const LAYERS: LayerToggle[] = [
+  {
+    key: STORAGE_KEYS.activeAiLayer,
+    label: "Active AI Layer",
+    description: "Earn while your AI models are generating responses.",
+  },
+  {
+    key: STORAGE_KEYS.behavioralLayer,
+    label: "Behavioral Layer",
+    description: "Capture mindful wait-time signals from chat sessions.",
+  },
+  {
+    key: STORAGE_KEYS.passiveDepinLayer,
+    label: "Passive DePIN Layer",
+    description: "Background network participation for passive yield.",
+  },
+];
+
+function formatBalance(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function formatRelativeTime(createdAt: string): string {
+  const ms = Date.parse(createdAt.replace(" ", "T") + "Z");
+  if (Number.isNaN(ms)) return "";
+
+  const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+function parseBalanceResponse(json: unknown): number | null {
+  if (typeof json === "object" && json !== null) {
+    const obj = json as Record<string, unknown>;
+    if (typeof obj.balance === "number") return obj.balance;
+    if (typeof obj.data === "object" && obj.data !== null) {
+      const data = obj.data as Record<string, unknown>;
+      if (typeof data.balance === "number") return data.balance;
+    }
+  }
+  return null;
+}
+
+function parseTransactionsResponse(json: unknown): Transaction[] | null {
+  if (Array.isArray(json)) return json as Transaction[];
+  if (typeof json === "object" && json !== null) {
+    const obj = json as Record<string, unknown>;
+    if (Array.isArray(obj.data)) return obj.data as Transaction[];
+    if (Array.isArray(obj.transactions)) return obj.transactions as Transaction[];
+    if (typeof obj.data === "object" && obj.data !== null) {
+      const data = obj.data as Record<string, unknown>;
+      if (Array.isArray(data.transactions)) {
+        return data.transactions as Transaction[];
+      }
+    }
+  }
+  return null;
+}
+
+function ToggleSwitch({
+  enabled,
+  label,
+  description,
+  onChange,
+}: {
+  enabled: boolean;
+  label: string;
+  description: string;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-xl border border-omni-border bg-omni-surface px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-medium text-white">{label}</p>
+        <p className="mt-0.5 text-xs leading-relaxed text-zinc-400">
+          {description}
+        </p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        aria-label={label}
+        onClick={() => onChange(!enabled)}
+        className={`relative h-7 w-12 shrink-0 rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-omni-neon focus-visible:ring-offset-2 focus-visible:ring-offset-omni-bg ${
+          enabled ? "bg-omni-neonDim" : "bg-zinc-700"
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 left-0.5 h-6 w-6 rounded-full bg-white shadow-md transition-transform duration-200 ${
+            enabled ? "translate-x-5" : "translate-x-0"
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
+
+export default function App() {
+  const [earnings, setEarnings] = useState(0);
+  const [balanceSource, setBalanceSource] = useState<"api" | "local">("local");
+  const [layers, setLayers] = useState<Record<LayerKey, boolean>>({
+    [STORAGE_KEYS.activeAiLayer]: true,
+    [STORAGE_KEYS.behavioralLayer]: false,
+    [STORAGE_KEYS.passiveDepinLayer]: false,
+  });
+  const [loaded, setLoaded] = useState(false);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [transactionsLoading, setTransactionsLoading] = useState(true);
+  const [transactionsOffline, setTransactionsOffline] = useState(false);
+  const balanceSourceRef = useRef(balanceSource);
+  balanceSourceRef.current = balanceSource;
+
+  useEffect(() => {
+    chrome.storage.local.get(
+      [
+        STORAGE_KEYS.earnings,
+        STORAGE_KEYS.activeAiLayer,
+        STORAGE_KEYS.behavioralLayer,
+        STORAGE_KEYS.passiveDepinLayer,
+      ],
+      (result) => {
+        setEarnings(Number(result[STORAGE_KEYS.earnings] ?? 0));
+        setLayers({
+          [STORAGE_KEYS.activeAiLayer]: Boolean(
+            result[STORAGE_KEYS.activeAiLayer] ?? true,
+          ),
+          [STORAGE_KEYS.behavioralLayer]: Boolean(
+            result[STORAGE_KEYS.behavioralLayer] ?? false,
+          ),
+          [STORAGE_KEYS.passiveDepinLayer]: Boolean(
+            result[STORAGE_KEYS.passiveDepinLayer] ?? false,
+          ),
+        });
+        setLoaded(true);
+      },
+    );
+
+    void (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/balance/${USER_ID}`);
+        if (!res.ok) throw new Error(`Balance API responded with ${res.status}`);
+        const balance = parseBalanceResponse(await res.json());
+        if (balance === null) throw new Error("Unexpected balance response shape");
+        setEarnings(balance);
+        setBalanceSource("api");
+      } catch {
+        setBalanceSource("local");
+      }
+    })();
+
+    void (async () => {
+      setTransactionsLoading(true);
+      setTransactionsOffline(false);
+      try {
+        const res = await fetch(
+          `${API_BASE}/transactions/${USER_ID}?limit=10`,
+        );
+        if (!res.ok) throw new Error(`Transactions API responded with ${res.status}`);
+        const parsed = parseTransactionsResponse(await res.json());
+        if (parsed === null) throw new Error("Unexpected transactions response shape");
+        setTransactions(parsed);
+      } catch {
+        setTransactionsOffline(true);
+      } finally {
+        setTransactionsLoading(false);
+      }
+    })();
+
+    const onStorageChange = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== "local") return;
+
+      if (changes[STORAGE_KEYS.earnings] && balanceSourceRef.current === "local") {
+        setEarnings(Number(changes[STORAGE_KEYS.earnings].newValue ?? 0));
+      }
+
+      setLayers((prev) => {
+        const next = { ...prev };
+        for (const key of Object.values(STORAGE_KEYS)) {
+          if (key === STORAGE_KEYS.earnings) continue;
+          if (changes[key]) {
+            next[key as LayerKey] = Boolean(changes[key].newValue);
+          }
+        }
+        return next;
+      });
+    };
+
+    chrome.storage.onChanged.addListener(onStorageChange);
+    return () => chrome.storage.onChanged.removeListener(onStorageChange);
+  }, []);
+
+  const handleLayerToggle = useCallback((key: LayerKey, next: boolean) => {
+    setLayers((prev) => ({ ...prev, [key]: next }));
+    chrome.storage.local.set({ [key]: next });
+  }, []);
+
+  return (
+    <div className="min-h-[420px] bg-omni-bg p-5 text-white">
+      <header className="mb-6">
+        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+          OmniPiggy
+        </p>
+        <h1 className="mt-1 text-lg font-semibold text-white">
+          Personal AI Dividend
+        </h1>
+      </header>
+
+      <section className="mb-8 rounded-2xl border border-omni-border bg-omni-surface p-5">
+        <p className="text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Wallet Balance
+        </p>
+        <p
+          className={`mt-2 text-4xl font-bold tabular-nums text-omni-neon ${
+            loaded ? "animate-pulse-glow shadow-neon" : "opacity-50"
+          }`}
+          style={{ textShadow: "0 0 16px rgba(57, 255, 136, 0.45)" }}
+        >
+          {formatBalance(earnings)}
+        </p>
+        <p className="mt-2 text-xs text-zinc-500">
+          {balanceSource === "api"
+            ? "Live balance from Omni Bank"
+            : "Live balance synced from chrome.storage.local"}
+        </p>
+      </section>
+
+      <section className="mb-8">
+        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+          Protocol Layers
+        </h2>
+        <div className="space-y-2">
+          {LAYERS.map((layer) => (
+            <ToggleSwitch
+              key={layer.key}
+              enabled={layers[layer.key]}
+              label={layer.label}
+              description={layer.description}
+              onChange={(next) => handleLayerToggle(layer.key, next)}
+            />
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+          Recent Activity
+        </h2>
+        <div className="max-h-40 overflow-y-auto rounded-xl border border-omni-border bg-omni-surface">
+          {transactionsLoading ? (
+            <p className="px-4 py-6 text-center text-xs text-zinc-500">
+              Loading activity…
+            </p>
+          ) : transactionsOffline ? (
+            <p className="px-4 py-6 text-center text-xs text-zinc-500">
+              Bank offline
+            </p>
+          ) : transactions.length === 0 ? (
+            <p className="px-4 py-6 text-center text-xs text-zinc-500">
+              No transactions yet
+            </p>
+          ) : (
+            <ul className="divide-y divide-omni-border">
+              {transactions.map((tx) => (
+                <li
+                  key={tx.id}
+                  className="flex items-center justify-between gap-3 px-4 py-2.5"
+                >
+                  <span className="min-w-0 truncate text-xs text-zinc-300">
+                    {LAYER_LABELS[tx.layer] ?? tx.layer}
+                  </span>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <span className="text-xs font-semibold tabular-nums text-omni-neon">
+                      +{formatBalance(tx.amount)}
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      {formatRelativeTime(tx.created_at)}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}

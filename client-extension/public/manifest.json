@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "OmniPiggy: Personal AI Dividend",
+  "version": "0.1.0",
+  "description": "Track and monetize your personal AI interactions across supported chat platforms.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://localhost:3001/*"],
+  "action": {
+    "default_title": "OmniPiggy",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
