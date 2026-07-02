@@ -1,4 +1,5 @@
 const EARNINGS_KEY = "omniEarnings";
+const BEHAVIORAL_LAYER_KEY = "behavioralLayer";
 const DIVIDEND_AMOUNT = 0.1;
 const YIELD_API_URL = "http://localhost:3001/api/v1/yield";
 const USER_ID = "user-001";
@@ -19,6 +20,26 @@ let isGenerating = false;
 let boxMounted = false;
 let claimedThisCycle = false;
 let isClaiming = false;
+
+function isExtensionContextValid(): boolean {
+  try {
+    return Boolean(chrome.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
+function stopExtensionScript(): void {
+  if (observer) {
+    observer.disconnect();
+    observer = null;
+  }
+  if (rafHandle) {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = 0;
+  }
+  removeBox();
+}
 
 function injectStyles(): void {
   if (document.getElementById(STYLE_ID)) return;
@@ -180,8 +201,45 @@ function removeBox(): void {
   boxMounted = false;
 }
 
-function showMindfulBreakBox(): void {
+function isBehavioralLayerEnabled(): Promise<boolean> {
+  if (!isExtensionContextValid()) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([BEHAVIORAL_LAYER_KEY], (result) => {
+        resolve(result[BEHAVIORAL_LAYER_KEY] !== false);
+      });
+    } catch {
+      resolve(true);
+    }
+  });
+}
+
+function setupBehavioralLayerListener(): void {
+  if (!isExtensionContextValid()) return;
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (!isExtensionContextValid()) {
+        stopExtensionScript();
+        return;
+      }
+      if (areaName !== "local") return;
+      if (!changes[BEHAVIORAL_LAYER_KEY]) return;
+      if (changes[BEHAVIORAL_LAYER_KEY].newValue === false && boxMounted && !isClaiming) {
+        removeBox();
+      }
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function showMindfulBreakBox(): Promise<void> {
   if (boxMounted || claimedThisCycle || isClaiming) return;
+
+  const enabled = await isBehavioralLayerEnabled();
+  if (!enabled) return;
 
   injectStyles();
   removeBox();
@@ -235,14 +293,30 @@ async function handleClaim(
     }
 
     const current = await new Promise<number>((resolve) => {
-      chrome.storage.local.get([EARNINGS_KEY], (result) => {
-        resolve(Number(result[EARNINGS_KEY] ?? 0));
-      });
+      if (!isExtensionContextValid()) {
+        resolve(0);
+        return;
+      }
+      try {
+        chrome.storage.local.get([EARNINGS_KEY], (result) => {
+          resolve(Number(result[EARNINGS_KEY] ?? 0));
+        });
+      } catch {
+        resolve(0);
+      }
     });
     const next = Math.round((current + DIVIDEND_AMOUNT) * 100) / 100;
 
     await new Promise<void>((resolve) => {
-      chrome.storage.local.set({ [EARNINGS_KEY]: next }, () => resolve());
+      if (!isExtensionContextValid()) {
+        resolve();
+        return;
+      }
+      try {
+        chrome.storage.local.set({ [EARNINGS_KEY]: next }, () => resolve());
+      } catch {
+        resolve();
+      }
     });
 
     button.classList.add("omni-claimed");
@@ -274,6 +348,12 @@ async function handleClaim(
 
 function evaluateWaitState(): void {
   rafHandle = 0;
+
+  if (!isExtensionContextValid()) {
+    stopExtensionScript();
+    return;
+  }
+
   const active = detectActiveWaitState();
 
   if (active && !isGenerating) {
@@ -283,19 +363,25 @@ function evaluateWaitState(): void {
   isGenerating = active;
 
   if (active && !claimedThisCycle) {
-    showMindfulBreakBox();
+    void showMindfulBreakBox();
   } else if (!active && boxMounted && !isClaiming) {
     removeBox();
   }
 }
 
 function scheduleEvaluation(): void {
+  if (!isExtensionContextValid()) {
+    stopExtensionScript();
+    return;
+  }
   if (rafHandle) return;
   rafHandle = window.requestAnimationFrame(evaluateWaitState);
 }
 
 function startObserver(): void {
   if (observer) return;
+
+  setupBehavioralLayerListener();
 
   observer = new MutationObserver(scheduleEvaluation);
   observer.observe(document.documentElement, {

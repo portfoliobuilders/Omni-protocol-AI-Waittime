@@ -8,6 +8,7 @@ const STORAGE_KEYS = {
 } as const;
 
 const API_BASE = "http://localhost:3001/api/v1";
+const HEALTH_URL = "http://localhost:3001/health";
 const USER_ID = "user-001";
 
 type LayerKey =
@@ -159,6 +160,7 @@ export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [transactionsLoading, setTransactionsLoading] = useState(true);
   const [transactionsOffline, setTransactionsOffline] = useState(false);
+  const [bankOnline, setBankOnline] = useState<boolean | null>(null);
   const balanceSourceRef = useRef(balanceSource);
   balanceSourceRef.current = balanceSource;
 
@@ -188,6 +190,7 @@ export default function App() {
     );
 
     void (async () => {
+      let bankKnownOnline = false;
       try {
         const res = await fetch(`${API_BASE}/balance/${USER_ID}`);
         if (!res.ok) throw new Error(`Balance API responded with ${res.status}`);
@@ -195,8 +198,22 @@ export default function App() {
         if (balance === null) throw new Error("Unexpected balance response shape");
         setEarnings(balance);
         setBalanceSource("api");
+        setBankOnline(true);
+        bankKnownOnline = true;
       } catch {
         setBalanceSource("local");
+      }
+
+      if (!bankKnownOnline) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(() => controller.abort(), 3000);
+          const healthRes = await fetch(HEALTH_URL, { signal: controller.signal });
+          window.clearTimeout(timeoutId);
+          setBankOnline(healthRes.ok);
+        } catch {
+          setBankOnline(false);
+        }
       }
     })();
 
@@ -252,12 +269,28 @@ export default function App() {
   return (
     <div className="min-h-[420px] bg-omni-bg p-5 text-white">
       <header className="mb-6">
-        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
-          OmniPiggy
-        </p>
-        <h1 className="mt-1 text-lg font-semibold text-white">
-          Personal AI Dividend
-        </h1>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500">
+              OmniPiggy
+            </p>
+            <h1 className="mt-1 text-lg font-semibold text-white">
+              Personal AI Dividend
+            </h1>
+          </div>
+          {bankOnline !== null && (
+            <div className="flex shrink-0 items-center gap-1.5 rounded-full border border-omni-border bg-omni-surface px-2 py-1">
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  bankOnline ? "bg-omni-neon" : "bg-zinc-500"
+                }`}
+              />
+              <span className="text-[10px] text-zinc-400">
+                {bankOnline ? "Bank online" : "Bank offline"}
+              </span>
+            </div>
+          )}
+        </div>
       </header>
 
       <section className="mb-8 rounded-2xl border border-omni-border bg-omni-surface p-5">
@@ -311,7 +344,7 @@ export default function App() {
             </p>
           ) : transactions.length === 0 ? (
             <p className="px-4 py-6 text-center text-xs text-zinc-500">
-              No transactions yet
+              No dividends claimed yet
             </p>
           ) : (
             <ul className="divide-y divide-omni-border">
