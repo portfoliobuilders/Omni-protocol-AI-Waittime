@@ -35,7 +35,68 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     used INTEGER NOT NULL DEFAULT 0
   );
+
+  CREATE TABLE IF NOT EXISTS survey_questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT NOT NULL,
+    options TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+  );
+
+  CREATE TABLE IF NOT EXISTS survey_responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    question_id INTEGER NOT NULL,
+    answer TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, question_id)
+  );
 `);
+
+const surveyQuestionCount = db
+  .prepare(`SELECT COUNT(*) AS count FROM survey_questions`)
+  .get() as { count: number };
+
+if (surveyQuestionCount.count === 0) {
+  const insertSurveyQuestion = db.prepare(`
+    INSERT INTO survey_questions (question, options)
+    VALUES (?, ?)
+  `);
+
+  const seedSurveyQuestions = db.transaction(() => {
+    const questions = [
+      {
+        question: "How often do you use AI chat tools?",
+        options: ["Daily", "Weekly", "Rarely"],
+      },
+      {
+        question: "Where do you use AI most?",
+        options: ["Work", "School", "Personal", "Other"],
+      },
+      {
+        question: "What matters most in AI tools?",
+        options: ["Speed", "Accuracy", "Privacy", "Price"],
+      },
+      {
+        question: "How do AI tools feel today?",
+        options: ["Helpful", "Confusing", "Slow", "Fun"],
+      },
+      {
+        question: "Would you share anonymous usage data?",
+        options: ["Yes", "No", "Maybe"],
+      },
+    ];
+
+    for (const surveyQuestion of questions) {
+      insertSurveyQuestion.run(
+        surveyQuestion.question,
+        JSON.stringify(surveyQuestion.options),
+      );
+    }
+  });
+
+  seedSurveyQuestions();
+}
 
 export interface TransactionRow {
   id: number;
@@ -118,6 +179,18 @@ interface ClaimSessionRow {
   used: number;
 }
 
+interface SurveyQuestionRow {
+  id: number;
+  question: string;
+  options: string;
+}
+
+export interface SurveyQuestion {
+  id: number;
+  question: string;
+  options: string[];
+}
+
 const insertClaimSession = db.prepare(`
   INSERT INTO claim_sessions (token, user_id)
   VALUES (?, ?)
@@ -132,6 +205,35 @@ const selectClaimSession = db.prepare(`
 const markClaimSessionUsed = db.prepare(`
   UPDATE claim_sessions SET used = 1 WHERE token = ?
 `);
+
+const selectNextSurveyQuestion = db.prepare(`
+  SELECT id, question, options
+  FROM survey_questions
+  WHERE active = 1
+    AND id NOT IN (
+      SELECT question_id
+      FROM survey_responses
+      WHERE user_id = ?
+    )
+  ORDER BY id ASC
+  LIMIT 1
+`);
+
+const selectSurveyQuestionById = db.prepare(`
+  SELECT id, question, options
+  FROM survey_questions
+  WHERE id = ?
+`);
+
+const insertSurveyResponse = db.prepare(`
+  INSERT INTO survey_responses (user_id, question_id, answer)
+  VALUES (?, ?, ?)
+`);
+
+function parseSurveyOptions(optionsJson: string): string[] {
+  const options = JSON.parse(optionsJson);
+  return Array.isArray(options) ? options.filter((option) => typeof option === "string") : [];
+}
 
 export type ConsumeClaimSessionResult =
   | { ok: true }
@@ -168,5 +270,58 @@ export const consumeClaimSession = db.transaction(
 
     markClaimSessionUsed.run(token);
     return { ok: true };
+  },
+);
+
+export function getNextSurveyQuestion(userId: string): SurveyQuestion | null {
+  const row = selectNextSurveyQuestion.get(userId) as SurveyQuestionRow | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    question: row.question,
+    options: parseSurveyOptions(row.options),
+  };
+}
+
+export type RecordSurveyResponseResult =
+  | { ok: true }
+  | { ok: false; reason: "invalid" | "already_answered" };
+
+export const recordSurveyResponse = db.transaction(
+  (
+    userId: string,
+    questionId: number,
+    answer: string,
+  ): RecordSurveyResponseResult => {
+    const row = selectSurveyQuestionById.get(questionId) as
+      | SurveyQuestionRow
+      | undefined;
+
+    if (!row) {
+      return { ok: false, reason: "invalid" };
+    }
+
+    const options = parseSurveyOptions(row.options);
+
+    if (!options.includes(answer)) {
+      return { ok: false, reason: "invalid" };
+    }
+
+    try {
+      insertSurveyResponse.run(userId, questionId, answer);
+      return { ok: true };
+    } catch (err: unknown) {
+      if (
+        err instanceof Error &&
+        err.message.includes("UNIQUE constraint failed")
+      ) {
+        return { ok: false, reason: "already_answered" };
+      }
+      throw err;
+    }
   },
 );

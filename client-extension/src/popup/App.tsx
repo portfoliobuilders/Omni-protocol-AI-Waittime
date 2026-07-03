@@ -2,12 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 const STORAGE_KEYS = {
   earnings: "omniEarnings",
+  userId: "omniUserId",
   activeAiLayer: "activeAiLayer",
   behavioralLayer: "behavioralLayer",
   passiveDepinLayer: "passiveDepinLayer",
 } as const;
-
-const USER_ID = "user-001";
 
 type LayerKey =
   | typeof STORAGE_KEYS.activeAiLayer
@@ -35,7 +34,7 @@ interface WalletData {
 }
 
 type BackgroundMessage =
-  | { type: "GET_WALLET"; payload: { userId: string; limit: number } }
+  | { type: "GET_WALLET"; payload?: { limit?: number } }
   | { type: "GET_HEALTH" };
 
 type BackgroundResponse =
@@ -178,6 +177,7 @@ export default function App() {
   const [transactionsLoading, setTransactionsLoading] = useState(true);
   const [transactionsOffline, setTransactionsOffline] = useState(false);
   const [bankOnline, setBankOnline] = useState<boolean | null>(null);
+  const [userIdPrefix, setUserIdPrefix] = useState<string | null>(null);
   const balanceSourceRef = useRef(balanceSource);
   balanceSourceRef.current = balanceSource;
 
@@ -185,12 +185,15 @@ export default function App() {
     chrome.storage.local.get(
       [
         STORAGE_KEYS.earnings,
+        STORAGE_KEYS.userId,
         STORAGE_KEYS.activeAiLayer,
         STORAGE_KEYS.behavioralLayer,
         STORAGE_KEYS.passiveDepinLayer,
       ],
       (result) => {
         setEarnings(Number(result[STORAGE_KEYS.earnings] ?? 0));
+        const userId = result[STORAGE_KEYS.userId];
+        setUserIdPrefix(typeof userId === "string" ? userId.slice(0, 8) : null);
         setLayers({
           [STORAGE_KEYS.activeAiLayer]: Boolean(
             result[STORAGE_KEYS.activeAiLayer] ?? true,
@@ -214,7 +217,7 @@ export default function App() {
       try {
         const walletResponse = await sendBackgroundMessage({
           type: "GET_WALLET",
-          payload: { userId: USER_ID, limit: 10 },
+          payload: { limit: 10 },
         });
         if (!walletResponse.ok) {
           throw new Error(
@@ -260,10 +263,15 @@ export default function App() {
         setEarnings(Number(changes[STORAGE_KEYS.earnings].newValue ?? 0));
       }
 
+      if (changes[STORAGE_KEYS.userId]) {
+        const nextId = changes[STORAGE_KEYS.userId].newValue;
+        setUserIdPrefix(typeof nextId === "string" ? nextId.slice(0, 8) : null);
+      }
+
       setLayers((prev) => {
         const next = { ...prev };
         for (const key of Object.values(STORAGE_KEYS)) {
-          if (key === STORAGE_KEYS.earnings) continue;
+          if (key === STORAGE_KEYS.earnings || key === STORAGE_KEYS.userId) continue;
           if (changes[key]) {
             next[key as LayerKey] = Boolean(changes[key].newValue);
           }
@@ -385,6 +393,12 @@ export default function App() {
           )}
         </div>
       </section>
+
+      <footer className="mt-6 border-t border-omni-border pt-3 text-center">
+        <p className="text-[10px] font-mono tracking-wide text-zinc-600">
+          ID: {userIdPrefix ?? "…"}
+        </p>
+      </footer>
     </div>
   );
 }

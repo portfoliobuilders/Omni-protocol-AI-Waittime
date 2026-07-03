@@ -2,6 +2,9 @@ const API_BASE = "http://localhost:3001/api/v1";
 const HEALTH_URL = "http://localhost:3001/health";
 const REQUEST_TIMEOUT_MS = 5000;
 const EARNINGS_KEY = "omniEarnings";
+const USER_ID_KEY = "omniUserId";
+
+let cachedUserId: string | null = null;
 
 export interface ClaimYieldPayload {
   userId: string;
@@ -9,7 +12,11 @@ export interface ClaimYieldPayload {
   layer: string;
   nonce: string;
   sessionToken: string | null;
+  surveyQuestionId?: number;
+  surveyAnswer?: string;
 }
+
+type ClaimYieldClientPayload = Omit<ClaimYieldPayload, "userId">;
 
 interface Transaction {
   id: number;
@@ -21,9 +28,10 @@ interface Transaction {
 }
 
 type ApiMessage =
-  | { type: "SESSION_START"; payload: { userId: string } }
-  | { type: "CLAIM_YIELD"; payload: ClaimYieldPayload }
-  | { type: "GET_WALLET"; payload: { userId: string; limit?: number } }
+  | { type: "SESSION_START"; payload?: undefined }
+  | { type: "CLAIM_YIELD"; payload: ClaimYieldClientPayload }
+  | { type: "GET_SURVEY"; payload?: undefined }
+  | { type: "GET_WALLET"; payload?: { limit?: number } }
   | { type: "GET_HEALTH"; payload?: undefined };
 
 type ApiResponse =
@@ -65,7 +73,14 @@ async function requestJson<T>(
   const data = (await response.json()) as T;
 
   if (!response.ok) {
-    throw new BackendError(`Backend responded with ${response.status}`, response.status);
+    let message = `Backend responded with ${response.status}`;
+    if (typeof data === "object" && data !== null) {
+      const serverMessage = (data as Record<string, unknown>).message;
+      if (typeof serverMessage === "string" && serverMessage) {
+        message = serverMessage;
+      }
+    }
+    throw new BackendError(message, response.status);
   }
 
   return data;
@@ -89,6 +104,10 @@ export function claimYield(payload: ClaimYieldPayload): Promise<unknown> {
 
 export function getBalance(userId: string): Promise<unknown> {
   return requestJson(`${API_BASE}/balance/${encodeURIComponent(userId)}`);
+}
+
+export function getSurveyNext(userId: string): Promise<unknown> {
+  return requestJson(`${API_BASE}/survey/next/${encodeURIComponent(userId)}`);
 }
 
 export function getTransactions(
@@ -159,6 +178,30 @@ function storageSet(values: Record<string, unknown>): Promise<void> {
   });
 }
 
+function storageGetString(key: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([key], (result) => {
+      const value = result[key];
+      resolve(typeof value === "string" ? value : undefined);
+    });
+  });
+}
+
+export async function ensureUserId(): Promise<string> {
+  if (cachedUserId) return cachedUserId;
+
+  const stored = await storageGetString(USER_ID_KEY);
+  if (stored) {
+    cachedUserId = stored;
+    return stored;
+  }
+
+  const userId = crypto.randomUUID();
+  await storageSet({ [USER_ID_KEY]: userId });
+  cachedUserId = userId;
+  return userId;
+}
+
 async function updateStoredEarnings(amount: number): Promise<void> {
   const current = await storageGetNumber(EARNINGS_KEY);
   const next = Math.round((current + amount) * 100) / 100;
@@ -166,21 +209,26 @@ async function updateStoredEarnings(amount: number): Promise<void> {
 }
 
 async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
+  const userId = await ensureUserId();
+
   switch (message.type) {
     case "SESSION_START":
-      return { ok: true, data: await startSession(message.payload.userId) };
+      return { ok: true, data: await startSession(userId) };
 
     case "CLAIM_YIELD": {
-      const data = await claimYield(message.payload);
+      const data = await claimYield({ ...message.payload, userId });
       await updateStoredEarnings(message.payload.amount);
       return { ok: true, data };
     }
 
+    case "GET_SURVEY":
+      return { ok: true, data: await getSurveyNext(userId) };
+
     case "GET_WALLET": {
-      const limit = message.payload.limit ?? 10;
+      const limit = message.payload?.limit ?? 10;
       const [balanceJson, transactionsJson] = await Promise.all([
-        getBalance(message.payload.userId),
-        getTransactions(message.payload.userId, limit),
+        getBalance(userId),
+        getTransactions(userId, limit),
       ]);
 
       return {
@@ -196,6 +244,10 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
       return { ok: true, data: await getHealth() };
   }
 }
+
+chrome.runtime.onInstalled.addListener(() => {
+  void ensureUserId();
+});
 
 chrome.runtime.onMessage.addListener((message: ApiMessage, _sender, sendResponse) => {
   void handleMessage(message)

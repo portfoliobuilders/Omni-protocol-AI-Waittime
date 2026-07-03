@@ -3,7 +3,6 @@ const AMOUNT_TIER2 = 0.1;
 const AMOUNT_TIER3 = 0.25;
 const TIER1_MAX_SEC = 4;
 const TIER2_MAX_SEC = 14;
-const USER_ID = "user-001";
 const YIELD_LAYER = "behavioralLayer";
 const BOX_ID = "omni-piggy-mindful-break";
 const STYLE_ID = "omni-piggy-styles";
@@ -15,6 +14,9 @@ const GENERATION_SELECTORS = [
   'button[aria-label="Stop streaming"]',
 ].join(", ");
 
+const ANCHOR_WALK_MAX = 12;
+const ANCHOR_MIN_WIDTH = 300;
+
 let observer: MutationObserver | null = null;
 let rafHandle = 0;
 let isGenerating = false;
@@ -24,17 +26,28 @@ let isClaiming = false;
 let currentSessionToken: string | null = null;
 let generationStartedAt: number | null = null;
 let waitTimerInterval: number | null = null;
+let surveyFetchedThisCycle = false;
+let surveyFetchInProgress = false;
+let currentSurvey: SurveyQuestion | null = null;
+
+type SurveyQuestion = {
+  id: number;
+  question: string;
+  options: string[];
+};
 
 type BackgroundMessage =
-  | { type: "SESSION_START"; payload: { userId: string } }
+  | { type: "SESSION_START"; payload?: undefined }
+  | { type: "GET_SURVEY"; payload?: undefined }
   | {
       type: "CLAIM_YIELD";
       payload: {
-        userId: string;
         amount: number;
         layer: string;
         nonce: string;
         sessionToken: string | null;
+        surveyQuestionId?: number;
+        surveyAnswer?: string;
       };
     };
 
@@ -108,6 +121,88 @@ function startWaitTimer(): void {
   }, 1000);
 }
 
+function clearSurveyOptions(box: HTMLElement): void {
+  const container = box.querySelector<HTMLElement>(".omni-survey-options");
+  if (container) {
+    container.hidden = true;
+    container.innerHTML = "";
+    delete container.dataset.surveyId;
+  }
+}
+
+function renderTier3Survey(
+  box: HTMLElement,
+  title: HTMLElement,
+  body: HTMLElement,
+  counter: HTMLElement,
+  button: HTMLButtonElement,
+): void {
+  if (!currentSurvey) return;
+
+  title.textContent = "💬 Quick Question — earn $0.25";
+  body.textContent = currentSurvey.question;
+  body.hidden = false;
+  counter.hidden = true;
+  button.hidden = true;
+
+  const container = box.querySelector<HTMLElement>(".omni-survey-options");
+  if (!container) return;
+
+  if (container.dataset.surveyId === String(currentSurvey.id)) return;
+  container.dataset.surveyId = String(currentSurvey.id);
+
+  container.hidden = false;
+  container.innerHTML = "";
+
+  for (const option of currentSurvey.options) {
+    const optBtn = document.createElement("button");
+    optBtn.type = "button";
+    optBtn.className = "omni-survey-option";
+    optBtn.textContent = option;
+    optBtn.addEventListener("click", () => {
+      void handleClaim(box, button, {
+        surveyQuestionId: currentSurvey!.id,
+        surveyAnswer: option,
+      });
+    });
+    container.appendChild(optBtn);
+  }
+}
+
+async function fetchSurveyForTier3(): Promise<void> {
+  if (surveyFetchedThisCycle || surveyFetchInProgress) return;
+  surveyFetchInProgress = true;
+
+  try {
+    const response = await sendBackgroundMessage({ type: "GET_SURVEY" });
+    surveyFetchedThisCycle = true;
+
+    if (response.ok) {
+      const payload = response.data as {
+        success?: boolean;
+        data?: { question?: SurveyQuestion | null };
+      };
+      const question =
+        payload.success && payload.data?.question ? payload.data.question : null;
+      if (question && question.options.length >= 2) {
+        currentSurvey = question;
+      } else {
+        currentSurvey = null;
+      }
+    } else {
+      currentSurvey = null;
+    }
+  } catch {
+    surveyFetchedThisCycle = true;
+    currentSurvey = null;
+  } finally {
+    surveyFetchInProgress = false;
+    if (boxMounted && !claimedThisCycle && !isClaiming) {
+      updateBoxTier();
+    }
+  }
+}
+
 function updateBoxTier(): void {
   const box = document.getElementById(BOX_ID);
   if (!box || isClaiming || claimedThisCycle) return;
@@ -136,11 +231,31 @@ function updateBoxTier(): void {
   button.hidden = false;
 
   if (tier === 2) {
+    clearSurveyOptions(box);
     title.textContent = "🧘 Mindful Break";
     button.textContent = "Claim $0.10 Dividend";
     return;
   }
 
+  if (!surveyFetchedThisCycle && !surveyFetchInProgress) {
+    void fetchSurveyForTier3();
+  }
+
+  if (surveyFetchInProgress && !surveyFetchedThisCycle) {
+    clearSurveyOptions(box);
+    title.textContent = "💎 Deep Work Bonus";
+    body.hidden = true;
+    counter.hidden = true;
+    button.hidden = true;
+    return;
+  }
+
+  if (currentSurvey) {
+    renderTier3Survey(box, title, body, counter, button);
+    return;
+  }
+
+  clearSurveyOptions(box);
   title.textContent = "💎 Deep Work Bonus";
   button.textContent = "Claim $0.25 Dividend";
 }
@@ -152,11 +267,7 @@ function injectStyles(): void {
   style.id = STYLE_ID;
   style.textContent = `
     #${BOX_ID} {
-      position: fixed;
-      top: 20px;
-      right: 20px;
       z-index: 2147483647;
-      width: 280px;
       padding: 18px 20px;
       border-radius: 16px;
       border: 1px solid rgba(57, 255, 136, 0.25);
@@ -167,17 +278,49 @@ function injectStyles(): void {
         inset 0 1px 0 rgba(255, 255, 255, 0.06);
       font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
       color: #f4f4f5;
-      transform: translateX(0);
       opacity: 1;
-      transition:
-        transform 0.55s cubic-bezier(0.4, 0, 0.2, 1),
-        opacity 0.55s cubic-bezier(0.4, 0, 0.2, 1);
       pointer-events: auto;
     }
 
-    #${BOX_ID}.omni-slide-out {
+    #${BOX_ID}.omni-floating {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      width: 280px;
+      transform: translateX(0);
+      transition:
+        transform 0.55s cubic-bezier(0.4, 0, 0.2, 1),
+        opacity 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    #${BOX_ID}.omni-inline {
+      position: relative;
+      display: block;
+      max-width: 420px;
+      margin: 12px 0;
+      width: 100%;
+      max-height: 600px;
+      overflow: hidden;
+      transition:
+        opacity 0.55s cubic-bezier(0.4, 0, 0.2, 1),
+        max-height 0.55s cubic-bezier(0.4, 0, 0.2, 1),
+        margin 0.55s cubic-bezier(0.4, 0, 0.2, 1),
+        padding 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    #${BOX_ID}.omni-floating.omni-slide-out {
       transform: translateX(calc(100% + 32px));
       opacity: 0;
+      pointer-events: none;
+    }
+
+    #${BOX_ID}.omni-inline.omni-slide-out {
+      opacity: 0;
+      max-height: 0;
+      margin-top: 0;
+      margin-bottom: 0;
+      padding-top: 0;
+      padding-bottom: 0;
       pointer-events: none;
     }
 
@@ -236,6 +379,38 @@ function injectStyles(): void {
       color: #ffffff;
     }
 
+    #${BOX_ID} .omni-survey-options {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    #${BOX_ID} .omni-survey-option {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.06);
+      color: #f4f4f5;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: left;
+      transition:
+        background 0.15s ease,
+        border-color 0.15s ease;
+    }
+
+    #${BOX_ID} .omni-survey-option:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(57, 255, 136, 0.35);
+    }
+
+    #${BOX_ID} .omni-survey-option:disabled {
+      cursor: default;
+      opacity: 0.6;
+    }
+
     #${BOX_ID} .omni-check {
       display: inline-flex;
       align-items: center;
@@ -278,6 +453,48 @@ function injectStyles(): void {
   `;
 
   document.head.appendChild(style);
+}
+
+function findGenerationIndicator(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(GENERATION_SELECTORS);
+}
+
+function isElementVisible(el: HTMLElement): boolean {
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  const style = window.getComputedStyle(el);
+  return (
+    style.display !== "none" &&
+    style.visibility !== "hidden" &&
+    parseFloat(style.opacity) > 0
+  );
+}
+
+function isInConversationRegion(el: HTMLElement): boolean {
+  return Boolean(
+    el.closest('main, [role="main"], article, form') ||
+      el.closest(
+        '[data-testid*="conversation"], [data-testid*="message"], [data-testid*="thread"], [data-testid*="composer"]',
+      ),
+  );
+}
+
+function findInlineAnchor(): HTMLElement | null {
+  const indicator = findGenerationIndicator();
+  if (!indicator) return null;
+
+  let current: HTMLElement | null = indicator.parentElement;
+  for (let depth = 0; depth < ANCHOR_WALK_MAX && current; depth++) {
+    if (
+      current.getBoundingClientRect().width >= ANCHOR_MIN_WIDTH &&
+      isElementVisible(current) &&
+      isInConversationRegion(current)
+    ) {
+      return current;
+    }
+    current = current.parentElement;
+  }
+  return null;
 }
 
 function detectActiveWaitState(): boolean {
@@ -390,7 +607,6 @@ async function requestSessionToken(): Promise<void> {
   try {
     const response = await sendBackgroundMessage({
       type: "SESSION_START",
-      payload: { userId: USER_ID },
     });
 
     if (!response.ok) return;
@@ -412,16 +628,7 @@ async function requestSessionToken(): Promise<void> {
   }
 }
 
-async function showMindfulBreakBox(): Promise<void> {
-  if (boxMounted || claimedThisCycle || isClaiming) return;
-  if (!currentSessionToken) return;
-
-  const enabled = await isBehavioralLayerEnabled();
-  if (!enabled) return;
-
-  injectStyles();
-  removeBox();
-
+function createMindfulBreakBox(): HTMLElement {
   const box = document.createElement("div");
   box.id = BOX_ID;
   box.setAttribute("role", "dialog");
@@ -442,8 +649,46 @@ async function showMindfulBreakBox(): Promise<void> {
   button.hidden = true;
   button.addEventListener("click", () => void handleClaim(box, button));
 
-  box.append(title, body, counter, button);
+  const surveyOptions = document.createElement("div");
+  surveyOptions.className = "omni-survey-options";
+  surveyOptions.hidden = true;
+
+  box.append(title, body, counter, surveyOptions, button);
+  return box;
+}
+
+function mountBox(box: HTMLElement): void {
+  const anchor = findInlineAnchor();
+  if (anchor?.parentElement) {
+    box.classList.add("omni-inline");
+    anchor.parentElement.insertBefore(box, anchor);
+    return;
+  }
+  box.classList.add("omni-floating");
   document.body.appendChild(box);
+}
+
+async function showMindfulBreakBox(): Promise<void> {
+  const existing = document.getElementById(BOX_ID);
+  if (existing?.isConnected) {
+    boxMounted = true;
+    return;
+  }
+  if (existing && !existing.isConnected) {
+    existing.remove();
+    boxMounted = false;
+  }
+  if (document.getElementById(BOX_ID)) return;
+  if (claimedThisCycle || isClaiming) return;
+  if (!currentSessionToken) return;
+
+  const enabled = await isBehavioralLayerEnabled();
+  if (!enabled) return;
+
+  injectStyles();
+
+  const box = createMindfulBreakBox();
+  mountBox(box);
   boxMounted = true;
   updateBoxTier();
   if (waitTimerInterval === null) {
@@ -454,26 +699,44 @@ async function showMindfulBreakBox(): Promise<void> {
 async function handleClaim(
   box: HTMLElement,
   button: HTMLButtonElement,
+  survey?: { surveyQuestionId: number; surveyAnswer: string },
 ): Promise<void> {
   if (isClaiming) return;
   isClaiming = true;
+
+  const surveyContainer = box.querySelector<HTMLElement>(".omni-survey-options");
+  if (surveyContainer) {
+    surveyContainer.querySelectorAll("button").forEach((el) => {
+      (el as HTMLButtonElement).disabled = true;
+    });
+  }
   button.disabled = true;
 
-  const claimAmount = getClaimAmount(getWaitTier(getElapsedSeconds()));
+  const claimAmount = survey
+    ? AMOUNT_TIER3
+    : getClaimAmount(getWaitTier(getElapsedSeconds()));
 
   try {
     const response = await sendBackgroundMessage({
       type: "CLAIM_YIELD",
       payload: {
-        userId: USER_ID,
         amount: claimAmount,
         layer: YIELD_LAYER,
         nonce: crypto.randomUUID(),
         sessionToken: currentSessionToken,
+        ...(survey
+          ? {
+              surveyQuestionId: survey.surveyQuestionId,
+              surveyAnswer: survey.surveyAnswer,
+            }
+          : {}),
       },
     });
 
     if (!response.ok) {
+      if (response.status === 400) {
+        console.error("[OmniPiggy] Survey claim rejected:", response.error);
+      }
       throw new Error(
         response.status
           ? `Yield API responded with ${response.status}`
@@ -481,6 +744,8 @@ async function handleClaim(
       );
     }
 
+    clearSurveyOptions(box);
+    button.hidden = false;
     button.classList.add("omni-claimed");
     button.innerHTML = `
       <span class="omni-check">
@@ -502,6 +767,8 @@ async function handleClaim(
     }, 2000);
   } catch (error) {
     console.error("[OmniPiggy] Failed to claim dividend:", error);
+    clearSurveyOptions(box);
+    button.hidden = false;
     button.textContent = "Bank offline — Retry";
     button.disabled = false;
     isClaiming = false;
@@ -520,6 +787,9 @@ function evaluateWaitState(): void {
 
   if (active && !isGenerating) {
     claimedThisCycle = false;
+    surveyFetchedThisCycle = false;
+    surveyFetchInProgress = false;
+    currentSurvey = null;
     generationStartedAt = Date.now();
     startWaitTimer();
     void requestSessionToken();
@@ -534,6 +804,10 @@ function evaluateWaitState(): void {
   isGenerating = active;
 
   if (active && !claimedThisCycle) {
+    const box = document.getElementById(BOX_ID);
+    if (box && !box.isConnected) {
+      boxMounted = false;
+    }
     void showMindfulBreakBox();
   } else if (!active && boxMounted && !isClaiming) {
     removeBox();

@@ -7,7 +7,9 @@ import {
   createClaimSession,
   DuplicateTransactionError,
   getBalance,
+  getNextSurveyQuestion,
   getTransactions,
+  recordSurveyResponse,
 } from "./db";
 
 dotenv.config();
@@ -31,6 +33,8 @@ interface YieldRequestBody {
   layer?: unknown;
   nonce?: unknown;
   sessionToken?: unknown;
+  surveyQuestionId?: unknown;
+  surveyAnswer?: unknown;
 }
 
 interface SessionStartRequestBody {
@@ -43,6 +47,8 @@ interface YieldTransaction {
   layer: YieldLayer;
   nonce: string;
   sessionToken: string;
+  surveyQuestionId?: number;
+  surveyAnswer?: string;
   timestamp: string;
 }
 
@@ -122,12 +128,40 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
     );
   }
 
+  const hasSurveyQuestionId = body.surveyQuestionId !== undefined;
+  const hasSurveyAnswer = body.surveyAnswer !== undefined;
+
+  if (hasSurveyQuestionId !== hasSurveyAnswer) {
+    throw new ValidationError(
+      "surveyQuestionId and surveyAnswer must be provided together.",
+    );
+  }
+
+  const surveyQuestionId =
+    typeof body.surveyQuestionId === "number" ? body.surveyQuestionId : NaN;
+  const surveyAnswer =
+    typeof body.surveyAnswer === "string" ? body.surveyAnswer.trim() : "";
+
+  if (
+    hasSurveyQuestionId &&
+    (!Number.isInteger(surveyQuestionId) || surveyQuestionId <= 0)
+  ) {
+    throw new ValidationError("surveyQuestionId must be a positive integer.");
+  }
+
+  if (hasSurveyAnswer && !surveyAnswer) {
+    throw new ValidationError(
+      "surveyAnswer must be a non-empty string when provided.",
+    );
+  }
+
   return {
     userId,
     amount: Math.round(amount * 100) / 100,
     layer: layer as YieldLayer,
     nonce,
     sessionToken,
+    ...(hasSurveyQuestionId ? { surveyQuestionId, surveyAnswer } : {}),
     timestamp: new Date().toISOString(),
   };
 }
@@ -173,6 +207,32 @@ app.post("/api/v1/session/start", (req: Request, res: Response) => {
   }
 });
 
+app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
+  try {
+    const userId = parseUserId(req.params.userId);
+    const question = getNextSurveyQuestion(userId);
+
+    res.status(200).json({
+      success: true,
+      data: { question },
+    });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Survey] Unexpected error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 app.post("/api/v1/yield", (req: Request, res: Response) => {
   try {
     const transaction = parseYieldRequest(req.body as YieldRequestBody);
@@ -197,6 +257,28 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
         message: "Wait period not satisfied.",
       });
       return;
+    }
+
+    if (
+      transaction.surveyQuestionId !== undefined &&
+      transaction.surveyAnswer !== undefined
+    ) {
+      const surveyResult = recordSurveyResponse(
+        transaction.userId,
+        transaction.surveyQuestionId,
+        transaction.surveyAnswer,
+      );
+
+      if (!surveyResult.ok) {
+        res.status(400).json({
+          success: false,
+          message:
+            surveyResult.reason === "already_answered"
+              ? "Survey question has already been answered."
+              : "Survey response is invalid.",
+        });
+        return;
+      }
     }
 
     const previousBalance = getBalance(transaction.userId);
