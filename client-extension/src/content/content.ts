@@ -1,8 +1,4 @@
 const BEHAVIORAL_LAYER_KEY = "behavioralLayer";
-const AMOUNT_TIER2 = 0.1;
-const AMOUNT_TIER3 = 0.25;
-const TIER1_MAX_SEC = 4;
-const TIER2_MAX_SEC = 14;
 const YIELD_LAYER = "behavioralLayer";
 const BOX_ID = "omni-piggy-mindful-break";
 const STYLE_ID = "omni-piggy-styles";
@@ -29,6 +25,32 @@ let waitTimerInterval: number | null = null;
 let surveyFetchedThisCycle = false;
 let surveyFetchInProgress = false;
 let currentSurvey: SurveyQuestion | null = null;
+let adFetchedThisCycle = false;
+let adFetchInProgress = false;
+let currentAd: SponsoredAd | null = null;
+let adImpressionSent = false;
+
+type RewardConfig = {
+  currency: string;
+  symbol: string;
+  tier2Amount: number;
+  tier3Amount: number;
+  minRedemption: number;
+  minWaitSeconds: number;
+  tier3Seconds: number;
+};
+
+const FALLBACK_REWARD_CONFIG: RewardConfig = {
+  currency: "INR",
+  symbol: "₹",
+  tier2Amount: 2,
+  tier3Amount: 10,
+  minRedemption: 100,
+  minWaitSeconds: 5,
+  tier3Seconds: 15,
+};
+
+let rewardConfig: RewardConfig | null = null;
 
 type SurveyQuestion = {
   id: number;
@@ -36,9 +58,23 @@ type SurveyQuestion = {
   options: string[];
 };
 
+type SponsoredAd = {
+  id: number;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+};
+
 type BackgroundMessage =
   | { type: "SESSION_START"; payload?: undefined }
+  | { type: "GET_CONFIG"; payload?: undefined }
   | { type: "GET_SURVEY"; payload?: undefined }
+  | { type: "GET_AD"; payload?: undefined }
+  | {
+      type: "AD_EVENT";
+      payload: { adId: number; event: "impression" | "click" };
+    }
   | {
       type: "CLAIM_YIELD";
       payload: {
@@ -84,17 +120,21 @@ function getElapsedSeconds(): number {
 }
 
 function getWaitTier(elapsedSec: number): WaitTier {
-  if (elapsedSec <= TIER1_MAX_SEC) return 1;
-  if (elapsedSec <= TIER2_MAX_SEC) return 2;
+  const cfg = rewardConfig ?? FALLBACK_REWARD_CONFIG;
+  if (elapsedSec < cfg.minWaitSeconds) return 1;
+  if (elapsedSec < cfg.tier3Seconds) return 2;
   return 3;
 }
 
 function getClaimAmount(tier: WaitTier): number {
-  return tier >= 3 ? AMOUNT_TIER3 : AMOUNT_TIER2;
+  const cfg = rewardConfig ?? FALLBACK_REWARD_CONFIG;
+  return tier >= 3 ? cfg.tier3Amount : cfg.tier2Amount;
 }
 
-function formatClaimAmount(amount: number): string {
-  return amount.toFixed(2);
+function formatMoney(amount: number): string {
+  const cfg = rewardConfig ?? FALLBACK_REWARD_CONFIG;
+  const display = amount % 1 === 0 ? String(amount) : amount.toFixed(2);
+  return `${cfg.symbol}${display}`;
 }
 
 function clearWaitTimer(): void {
@@ -139,7 +179,9 @@ function renderTier3Survey(
 ): void {
   if (!currentSurvey) return;
 
-  title.textContent = "💬 Quick Question — earn $0.25";
+  title.textContent = `💬 Quick Question — earn ${formatMoney(
+    (rewardConfig ?? FALLBACK_REWARD_CONFIG).tier3Amount,
+  )}`;
   body.textContent = currentSurvey.question;
   body.hidden = false;
   counter.hidden = true;
@@ -203,6 +245,100 @@ async function fetchSurveyForTier3(): Promise<void> {
   }
 }
 
+function hideAdCard(box: HTMLElement): void {
+  const container = box.querySelector<HTMLElement>(".omni-ad-card");
+  if (container) {
+    container.hidden = true;
+  }
+}
+
+async function fetchAdForTier2(): Promise<void> {
+  if (adFetchedThisCycle || adFetchInProgress) return;
+  adFetchInProgress = true;
+
+  try {
+    const response = await sendBackgroundMessage({ type: "GET_AD" });
+    adFetchedThisCycle = true;
+
+    if (response.ok) {
+      const payload = response.data as {
+        success?: boolean;
+        data?: { ad?: SponsoredAd | null };
+      };
+      const ad = payload.success && payload.data?.ad ? payload.data.ad : null;
+      if (ad && ad.headline && ad.cta_url) {
+        currentAd = ad;
+      } else {
+        currentAd = null;
+      }
+    } else {
+      currentAd = null;
+    }
+  } catch {
+    adFetchedThisCycle = true;
+    currentAd = null;
+  } finally {
+    adFetchInProgress = false;
+    if (boxMounted && !claimedThisCycle && !isClaiming) {
+      updateBoxTier();
+    }
+  }
+}
+
+function renderAdCard(box: HTMLElement): void {
+  const container = box.querySelector<HTMLElement>(".omni-ad-card");
+  if (!container) return;
+
+  if (!currentAd) {
+    container.hidden = true;
+    return;
+  }
+
+  if (container.dataset.adId === String(currentAd.id)) {
+    container.hidden = false;
+    return;
+  }
+
+  container.dataset.adId = String(currentAd.id);
+  container.hidden = false;
+  container.innerHTML = "";
+
+  const label = document.createElement("p");
+  label.className = "omni-ad-label";
+  label.textContent = "Sponsored";
+
+  const headline = document.createElement("p");
+  headline.className = "omni-ad-headline";
+  headline.textContent = currentAd.headline;
+
+  const adBody = document.createElement("p");
+  adBody.className = "omni-ad-body";
+  adBody.textContent = currentAd.body;
+
+  const cta = document.createElement("button");
+  cta.type = "button";
+  cta.className = "omni-ad-cta";
+  cta.textContent = currentAd.cta_label;
+  const adSnapshot = currentAd;
+  cta.addEventListener("click", () => {
+    void sendBackgroundMessage({
+      type: "AD_EVENT",
+      payload: { adId: adSnapshot.id, event: "click" },
+    });
+    window.open(adSnapshot.cta_url, "_blank", "noopener");
+  });
+
+  container.append(label, headline, adBody, cta);
+
+  if (!adImpressionSent) {
+    adImpressionSent = true;
+    void sendBackgroundMessage({
+      type: "AD_EVENT",
+      payload: { adId: currentAd.id, event: "impression" },
+    });
+  }
+}
+
 function updateBoxTier(): void {
   const box = document.getElementById(BOX_ID);
   if (!box || isClaiming || claimedThisCycle) return;
@@ -223,6 +359,7 @@ function updateBoxTier(): void {
     counter.textContent = `${elapsed}s`;
     counter.hidden = false;
     button.hidden = true;
+    hideAdCard(box);
     return;
   }
 
@@ -233,7 +370,13 @@ function updateBoxTier(): void {
   if (tier === 2) {
     clearSurveyOptions(box);
     title.textContent = "🧘 Mindful Break";
-    button.textContent = "Claim $0.10 Dividend";
+    button.textContent = `Claim ${formatMoney(
+      (rewardConfig ?? FALLBACK_REWARD_CONFIG).tier2Amount,
+    )} Dividend`;
+    if (!adFetchedThisCycle && !adFetchInProgress) {
+      void fetchAdForTier2();
+    }
+    renderAdCard(box);
     return;
   }
 
@@ -247,17 +390,22 @@ function updateBoxTier(): void {
     body.hidden = true;
     counter.hidden = true;
     button.hidden = true;
+    renderAdCard(box);
     return;
   }
 
   if (currentSurvey) {
     renderTier3Survey(box, title, body, counter, button);
+    renderAdCard(box);
     return;
   }
 
   clearSurveyOptions(box);
   title.textContent = "💎 Deep Work Bonus";
-  button.textContent = "Claim $0.25 Dividend";
+  button.textContent = `Claim ${formatMoney(
+    (rewardConfig ?? FALLBACK_REWARD_CONFIG).tier3Amount,
+  )} Dividend`;
+  renderAdCard(box);
 }
 
 function injectStyles(): void {
@@ -450,6 +598,59 @@ function injectStyles(): void {
       0% { opacity: 0; transform: rotate(45deg) scale(0.5); }
       100% { opacity: 1; transform: rotate(45deg) scale(1); }
     }
+
+    #${BOX_ID} .omni-ad-card {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    #${BOX_ID} .omni-ad-label {
+      margin: 0 0 6px;
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #71717a;
+    }
+
+    #${BOX_ID} .omni-ad-headline {
+      margin: 0 0 4px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #e4e4e7;
+      line-height: 1.35;
+    }
+
+    #${BOX_ID} .omni-ad-body {
+      margin: 0 0 10px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #a1a1aa;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    #${BOX_ID} .omni-ad-cta {
+      padding: 6px 12px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 8px;
+      background: transparent;
+      color: #d4d4d8;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition:
+        background 0.15s ease,
+        border-color 0.15s ease;
+    }
+
+    #${BOX_ID} .omni-ad-cta:hover {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.28);
+    }
   `;
 
   document.head.appendChild(style);
@@ -576,6 +777,22 @@ function clearSessionToken(): void {
   currentSessionToken = null;
 }
 
+async function ensureRewardConfig(): Promise<void> {
+  if (rewardConfig) return;
+
+  try {
+    const response = await sendBackgroundMessage({ type: "GET_CONFIG" });
+    if (response.ok && typeof response.data === "object" && response.data !== null) {
+      rewardConfig = response.data as RewardConfig;
+      return;
+    }
+  } catch {
+    // fall through to fallback
+  }
+
+  rewardConfig = FALLBACK_REWARD_CONFIG;
+}
+
 function sendBackgroundMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
   if (!isExtensionContextValid()) {
     return Promise.reject(new Error("Extension context invalidated"));
@@ -653,7 +870,11 @@ function createMindfulBreakBox(): HTMLElement {
   surveyOptions.className = "omni-survey-options";
   surveyOptions.hidden = true;
 
-  box.append(title, body, counter, surveyOptions, button);
+  const adCard = document.createElement("div");
+  adCard.className = "omni-ad-card";
+  adCard.hidden = true;
+
+  box.append(title, body, counter, surveyOptions, button, adCard);
   return box;
 }
 
@@ -713,7 +934,7 @@ async function handleClaim(
   button.disabled = true;
 
   const claimAmount = survey
-    ? AMOUNT_TIER3
+    ? (rewardConfig ?? FALLBACK_REWARD_CONFIG).tier3Amount
     : getClaimAmount(getWaitTier(getElapsedSeconds()));
 
   try {
@@ -750,7 +971,7 @@ async function handleClaim(
     button.innerHTML = `
       <span class="omni-check">
         <span class="omni-check-icon" aria-hidden="true"></span>
-        Claimed $${formatClaimAmount(claimAmount)}
+        Claimed ${formatMoney(claimAmount)}
       </span>
     `;
 
@@ -790,8 +1011,13 @@ function evaluateWaitState(): void {
     surveyFetchedThisCycle = false;
     surveyFetchInProgress = false;
     currentSurvey = null;
+    adFetchedThisCycle = false;
+    adFetchInProgress = false;
+    currentAd = null;
+    adImpressionSent = false;
     generationStartedAt = Date.now();
     startWaitTimer();
+    void ensureRewardConfig();
     void requestSessionToken();
   }
 

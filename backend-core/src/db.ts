@@ -73,6 +73,18 @@ db.exec(`
     event TEXT NOT NULL CHECK (event IN ('impression', 'click')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    method TEXT NOT NULL CHECK (method IN ('amazon_voucher', 'upi')),
+    detail TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'rejected')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+  );
 `);
 
 const surveyQuestionCount = db
@@ -492,6 +504,7 @@ export interface Ad {
 export interface AdStat {
   id: number;
   headline: string;
+  active: boolean;
   impressions: number;
   clicks: number;
 }
@@ -525,11 +538,12 @@ const selectAdStats = db.prepare(`
   SELECT
     a.id,
     a.headline,
+    a.active,
     COALESCE(SUM(CASE WHEN e.event = 'impression' THEN 1 ELSE 0 END), 0) AS impressions,
     COALESCE(SUM(CASE WHEN e.event = 'click' THEN 1 ELSE 0 END), 0) AS clicks
   FROM ads a
   LEFT JOIN ad_events e ON e.ad_id = a.id
-  GROUP BY a.id, a.headline
+  GROUP BY a.id, a.headline, a.active
   ORDER BY a.id ASC
 `);
 
@@ -570,5 +584,291 @@ export function recordAdEvent(
 }
 
 export function getAdStats(): AdStat[] {
-  return selectAdStats.all() as AdStat[];
+  const rows = selectAdStats.all() as Array<{
+    id: number;
+    headline: string;
+    active: number;
+    impressions: number;
+    clicks: number;
+  }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    headline: row.headline,
+    active: row.active === 1,
+    impressions: row.impressions,
+    clicks: row.clicks,
+  }));
 }
+
+export class ContentValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ContentValidationError";
+  }
+}
+
+const insertSurveyQuestion = db.prepare(`
+  INSERT INTO survey_questions (question, options)
+  VALUES (?, ?)
+`);
+
+const updateSurveyQuestionActive = db.prepare(`
+  UPDATE survey_questions SET active = ? WHERE id = ?
+`);
+
+const insertAd = db.prepare(`
+  INSERT INTO ads (headline, body, cta_label, cta_url)
+  VALUES (?, ?, ?, ?)
+`);
+
+const updateAdActive = db.prepare(`
+  UPDATE ads SET active = ? WHERE id = ?
+`);
+
+function validateSurveyOptions(options: string[]): string[] {
+  if (!Array.isArray(options)) {
+    throw new ContentValidationError("options must be an array.");
+  }
+
+  const trimmed = options
+    .filter((option) => typeof option === "string")
+    .map((option) => option.trim())
+    .filter((option) => option.length > 0);
+
+  if (trimmed.length < 2 || trimmed.length > 4) {
+    throw new ContentValidationError("options must contain 2 to 4 non-empty strings.");
+  }
+
+  return trimmed;
+}
+
+export function addSurveyQuestion(
+  question: string,
+  options: string[],
+): { id: number; question: string; options: string[] } {
+  const trimmedQuestion = question.trim();
+
+  if (!trimmedQuestion) {
+    throw new ContentValidationError("question must be a non-empty string.");
+  }
+
+  const validOptions = validateSurveyOptions(options);
+  const result = insertSurveyQuestion.run(
+    trimmedQuestion,
+    JSON.stringify(validOptions),
+  );
+
+  return {
+    id: Number(result.lastInsertRowid),
+    question: trimmedQuestion,
+    options: validOptions,
+  };
+}
+
+export type SetSurveyQuestionActiveResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" };
+
+export function setSurveyQuestionActive(
+  id: number,
+  active: boolean,
+): SetSurveyQuestionActiveResult {
+  const result = updateSurveyQuestionActive.run(active ? 1 : 0, id);
+  if (result.changes === 0) {
+    return { ok: false, reason: "not_found" };
+  }
+  return { ok: true };
+}
+
+export interface AdInput {
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+}
+
+export function addAd(input: AdInput): Ad {
+  const headline = input.headline.trim();
+  const body = input.body.trim();
+  const cta_label = input.cta_label.trim();
+  const cta_url = input.cta_url.trim();
+
+  if (!headline) {
+    throw new ContentValidationError("headline must be a non-empty string.");
+  }
+  if (!body) {
+    throw new ContentValidationError("body must be a non-empty string.");
+  }
+  if (!cta_label) {
+    throw new ContentValidationError("cta_label must be a non-empty string.");
+  }
+  if (!cta_url.startsWith("https://")) {
+    throw new ContentValidationError("cta_url must start with https://.");
+  }
+
+  const result = insertAd.run(headline, body, cta_label, cta_url);
+
+  return {
+    id: Number(result.lastInsertRowid),
+    headline,
+    body,
+    cta_label,
+    cta_url,
+  };
+}
+
+export type SetAdActiveResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" };
+
+export function setAdActive(id: number, active: boolean): SetAdActiveResult {
+  const result = updateAdActive.run(active ? 1 : 0, id);
+  if (result.changes === 0) {
+    return { ok: false, reason: "not_found" };
+  }
+  return { ok: true };
+}
+
+export type RedemptionMethod = "amazon_voucher" | "upi";
+export type RedemptionStatus = "pending" | "paid" | "rejected";
+
+export interface RedemptionRow {
+  id: number;
+  user_id: string;
+  amount: number;
+  method: string;
+  detail: string;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+const selectPendingRedemption = db.prepare(`
+  SELECT id FROM redemptions
+  WHERE user_id = ? AND status = 'pending'
+  LIMIT 1
+`);
+
+const deductFullBalance = db.prepare(`
+  UPDATE users SET balance = 0 WHERE user_id = @userId
+`);
+
+const insertRedemption = db.prepare(`
+  INSERT INTO redemptions (user_id, amount, method, detail)
+  VALUES (@userId, @amount, @method, @detail)
+`);
+
+const selectRedemptionById = db.prepare(`
+  SELECT id, user_id, amount, method, detail, status, created_at, resolved_at
+  FROM redemptions WHERE id = ?
+`);
+
+const updateRedemptionStatus = db.prepare(`
+  UPDATE redemptions
+  SET status = @status, resolved_at = datetime('now')
+  WHERE id = @id
+`);
+
+const selectAllRedemptions = db.prepare(`
+  SELECT id, user_id, amount, method, detail, status, created_at, resolved_at
+  FROM redemptions
+  ORDER BY created_at DESC, id DESC
+`);
+
+const selectRedemptionsByStatus = db.prepare(`
+  SELECT id, user_id, amount, method, detail, status, created_at, resolved_at
+  FROM redemptions
+  WHERE status = ?
+  ORDER BY created_at DESC, id DESC
+`);
+
+const selectRedemptionsByUser = db.prepare(`
+  SELECT id, user_id, amount, method, detail, status, created_at, resolved_at
+  FROM redemptions
+  WHERE user_id = ?
+  ORDER BY created_at DESC, id DESC
+`);
+
+export type RequestRedemptionResult =
+  | { ok: true; amount: number }
+  | { ok: false; reason: "below_minimum" | "already_pending" };
+
+export const requestRedemption = db.transaction(
+  (
+    userId: string,
+    method: RedemptionMethod,
+    detail: string,
+    minRedemption: number,
+  ): RequestRedemptionResult => {
+    upsertUser.run(userId);
+
+    const pending = selectPendingRedemption.get(userId) as
+      | { id: number }
+      | undefined;
+    if (pending) {
+      return { ok: false, reason: "already_pending" };
+    }
+
+    const balanceRow = selectBalance.get(userId) as { balance: number } | undefined;
+    const balance = balanceRow?.balance ?? 0;
+
+    if (balance < minRedemption) {
+      return { ok: false, reason: "below_minimum" };
+    }
+
+    const amount = Math.round(balance * 100) / 100;
+    deductFullBalance.run({ userId });
+    insertRedemption.run({ userId, amount, method, detail });
+
+    return { ok: true, amount };
+  },
+);
+
+export type ResolveRedemptionResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" | "already_resolved" | "invalid_status" };
+
+export const resolveRedemption = db.transaction(
+  (id: number, status: "paid" | "rejected"): ResolveRedemptionResult => {
+    if (status !== "paid" && status !== "rejected") {
+      return { ok: false, reason: "invalid_status" };
+    }
+
+    const row = selectRedemptionById.get(id) as RedemptionRow | undefined;
+    if (!row) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (row.status !== "pending") {
+      return { ok: false, reason: "already_resolved" };
+    }
+
+    if (status === "rejected") {
+      creditBalance.run({ userId: row.user_id, amount: row.amount });
+    }
+
+    updateRedemptionStatus.run({ id, status });
+    return { ok: true };
+  },
+);
+
+export function getRedemptions(status?: RedemptionStatus): RedemptionRow[] {
+  if (status) {
+    return selectRedemptionsByStatus.all(status) as RedemptionRow[];
+  }
+  return selectAllRedemptions.all() as RedemptionRow[];
+}
+
+export function getUserRedemptions(userId: string): RedemptionRow[] {
+  return selectRedemptionsByUser.all(userId) as RedemptionRow[];
+}
+
+export const resetLedger = db.transaction(() => {
+  db.exec(`
+    DELETE FROM transactions;
+    DELETE FROM redemptions;
+    DELETE FROM ad_events;
+    DELETE FROM survey_responses;
+    UPDATE users SET balance = 0;
+  `);
+});

@@ -5,9 +5,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  addAd,
+  addSurveyQuestion,
   applyYield,
   backupDatabase,
   consumeClaimSession,
+  ContentValidationError,
   createClaimSession,
   DuplicateTransactionError,
   getActiveAd,
@@ -16,13 +19,31 @@ import {
   getLedgerStats,
   getNextSurveyQuestion,
   getRecentTransactions,
+  getRedemptions,
   getSurveyResults,
   getTransactions,
+  getUserRedemptions,
   recordAdEvent,
   recordSurveyResponse,
+  requestRedemption,
+  resetLedger,
+  resolveRedemption,
+  setAdActive,
+  setSurveyQuestionActive,
 } from "./db";
 
 dotenv.config();
+
+// Single source of truth for reward economics (INR).
+const REWARD_ECONOMICS = {
+  currency: "INR",
+  symbol: "₹",
+  tier2Amount: 2,
+  tier3Amount: 10,
+  minRedemption: 100,
+  minWaitSeconds: 5,
+  tier3Seconds: 15,
+} as const;
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
 const PORT = Number(process.env.PORT ?? 3001);
@@ -58,9 +79,18 @@ interface AdEventRequestBody {
   event?: unknown;
 }
 
+interface RedeemRequestBody {
+  userId?: unknown;
+  method?: unknown;
+  detail?: unknown;
+}
+
+interface ResolveRedemptionBody {
+  status?: unknown;
+}
+
 interface YieldTransaction {
   userId: string;
-  amount: number;
   layer: YieldLayer;
   nonce: string;
   sessionToken: string;
@@ -76,7 +106,7 @@ app.disable("x-powered-by");
 app.use(
   cors({
     origin: true,
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
@@ -101,19 +131,17 @@ function parseUserId(userIdValue: unknown): string {
 function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
   const userId = parseUserId(body.userId);
 
-  const amount =
-    typeof body.amount === "number"
-      ? body.amount
-      : typeof body.amount === "string"
-        ? Number(body.amount)
-        : NaN;
+  if (body.amount !== undefined) {
+    const amount =
+      typeof body.amount === "number"
+        ? body.amount
+        : typeof body.amount === "string"
+          ? Number(body.amount)
+          : NaN;
 
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new ValidationError("amount must be a positive number.");
-  }
-
-  if (amount > 1_000_000) {
-    throw new ValidationError("amount exceeds the allowed maximum for this endpoint.");
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new ValidationError("amount must be a positive number.");
+    }
   }
 
   const layer =
@@ -174,7 +202,6 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
 
   return {
     userId,
-    amount: Math.round(amount * 100) / 100,
     layer: layer as YieldLayer,
     nonce,
     sessionToken,
@@ -216,6 +243,13 @@ app.get("/health", (_req: Request, res: Response) => {
     status: "ok",
     service: "omni-backend-core",
     timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/api/v1/config", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    data: { ...REWARD_ECONOMICS },
   });
 });
 
@@ -333,11 +367,20 @@ app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
 app.post("/api/v1/yield", (req: Request, res: Response) => {
   try {
     const transaction = parseYieldRequest(req.body as YieldRequestBody);
+    const isSurveyClaim =
+      transaction.surveyQuestionId !== undefined &&
+      transaction.surveyAnswer !== undefined;
+    const creditedAmount = isSurveyClaim
+      ? REWARD_ECONOMICS.tier3Amount
+      : REWARD_ECONOMICS.tier2Amount;
+    const minWaitSeconds = isSurveyClaim
+      ? REWARD_ECONOMICS.tier3Seconds
+      : REWARD_ECONOMICS.minWaitSeconds;
 
     const sessionResult = consumeClaimSession(
       transaction.sessionToken,
       transaction.userId,
-      5,
+      minWaitSeconds,
     );
 
     if (!sessionResult.ok) {
@@ -381,13 +424,14 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
     const previousBalance = getBalance(transaction.userId);
     const updatedBalance = applyYield({
       userId: transaction.userId,
-      amount: transaction.amount,
+      amount: creditedAmount,
       layer: transaction.layer,
       nonce: transaction.nonce,
     });
 
     console.info("[Omni Yield] Transaction accepted", {
       ...transaction,
+      creditedAmount,
       previousBalance,
       updatedBalance,
     });
@@ -397,7 +441,7 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
       message: "Yield transaction processed successfully.",
       data: {
         userId: transaction.userId,
-        creditedAmount: transaction.amount,
+        creditedAmount,
         layer: transaction.layer,
         previousBalance,
         updatedBalance,
@@ -510,6 +554,83 @@ app.post("/api/v1/ad/event", (req: Request, res: Response) => {
   }
 });
 
+app.post("/api/v1/redeem", (req: Request, res: Response) => {
+  try {
+    const body = req.body as RedeemRequestBody;
+    const userId = parseUserId(body.userId);
+    const method = parseRedemptionMethod(body.method);
+    const detail = parseRedemptionDetail(method, body.detail);
+
+    const result = requestRedemption(
+      userId,
+      method,
+      detail,
+      REWARD_ECONOMICS.minRedemption,
+    );
+
+    if (!result.ok) {
+      if (result.reason === "below_minimum") {
+        res.status(400).json({
+          success: false,
+          reason: "below_minimum",
+          message: `Balance is below the minimum redemption amount (${REWARD_ECONOMICS.symbol}${REWARD_ECONOMICS.minRedemption}).`,
+        });
+        return;
+      }
+
+      res.status(400).json({
+        success: false,
+        reason: "already_pending",
+        message: "You already have a pending redemption request.",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: { amount: result.amount },
+    });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Redeem] Unexpected error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
+app.get("/api/v1/redemptions/:userId", (req: Request, res: Response) => {
+  try {
+    const userId = parseUserId(req.params.userId);
+    res.status(200).json({
+      success: true,
+      data: { redemptions: getUserRedemptions(userId) },
+    });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Redemptions] Unexpected error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 app.get("/api/v1/admin/stats", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
@@ -538,6 +659,78 @@ app.get("/api/v1/admin/ads", requireAdminKey, (_req: Request, res: Response) => 
   });
 });
 
+app.get("/api/v1/admin/redemptions", requireAdminKey, (req: Request, res: Response) => {
+  const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
+  const status =
+    statusParam === "pending" || statusParam === "paid" || statusParam === "rejected"
+      ? statusParam
+      : undefined;
+
+  res.status(200).json({
+    success: true,
+    data: { redemptions: getRedemptions(status) },
+  });
+});
+
+app.post(
+  "/api/v1/admin/redemptions/:id/resolve",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const status = parseRedemptionStatus((req.body as ResolveRedemptionBody).status);
+      const result = resolveRedemption(id, status);
+
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Redemption not found."
+            : result.reason === "already_resolved"
+              ? "Redemption has already been resolved."
+              : "Invalid redemption status.";
+
+        res.status(result.reason === "not_found" ? 404 : 400).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({ success: true, data: { id, status } });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Resolve redemption error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.post("/api/v1/admin/reset-ledger", requireAdminKey, (_req: Request, res: Response) => {
+  try {
+    resetLedger();
+    res.status(200).json({
+      success: true,
+      message: "Ledger reset: transactions, redemptions, ad events, and survey responses cleared; user balances zeroed.",
+    });
+  } catch (error) {
+    console.error("[Omni Admin] Reset ledger error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 app.get("/api/v1/admin/backup", requireAdminKey, async (_req: Request, res: Response) => {
   const tempPath = path.join(os.tmpdir(), `omni-backup-${Date.now()}.db`);
   const downloadName = `omni-ledger-backup-${new Date().toISOString().slice(0, 10)}.db`;
@@ -563,6 +756,212 @@ app.get("/api/v1/admin/backup", requireAdminKey, async (_req: Request, res: Resp
     });
   }
 });
+
+function parsePositiveInt(value: unknown, fieldName: string): number {
+  const id =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number(value)
+        : NaN;
+
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new ValidationError(`${fieldName} must be a positive integer.`);
+  }
+
+  return id;
+}
+
+function parseActiveFlag(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  throw new ValidationError("active must be a boolean.");
+}
+
+function parseRedemptionMethod(value: unknown): "amazon_voucher" | "upi" {
+  const method = typeof value === "string" ? value.trim() : "";
+  if (method !== "amazon_voucher" && method !== "upi") {
+    throw new ValidationError(
+      "method must be 'amazon_voucher' or 'upi'.",
+    );
+  }
+  return method;
+}
+
+function parseRedemptionDetail(
+  method: "amazon_voucher" | "upi",
+  value: unknown,
+): string {
+  const detail = typeof value === "string" ? value.trim() : "";
+
+  if (!detail) {
+    throw new ValidationError("detail is required and must be a non-empty string.");
+  }
+
+  if (detail.length > 128) {
+    throw new ValidationError("detail must be 128 characters or fewer.");
+  }
+
+  if (method === "amazon_voucher") {
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(detail)) {
+      throw new ValidationError("detail must be a valid email address for amazon_voucher.");
+    }
+  }
+
+  return detail;
+}
+
+function parseRedemptionStatus(value: unknown): "paid" | "rejected" {
+  const status = typeof value === "string" ? value.trim() : "";
+  if (status !== "paid" && status !== "rejected") {
+    throw new ValidationError("status must be 'paid' or 'rejected'.");
+  }
+  return status;
+}
+
+app.post("/api/v1/admin/surveys", requireAdminKey, (req: Request, res: Response) => {
+  try {
+    const body = req.body as { question?: unknown; options?: unknown };
+    const question =
+      typeof body.question === "string" ? body.question : "";
+    const options = Array.isArray(body.options)
+      ? body.options.filter((option): option is string => typeof option === "string")
+      : [];
+
+    const created = addSurveyQuestion(question, options);
+
+    res.status(201).json({
+      success: true,
+      data: created,
+    });
+  } catch (error) {
+    if (error instanceof ContentValidationError || error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Admin] Add survey error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
+app.patch(
+  "/api/v1/admin/surveys/:id/active",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const active = parseActiveFlag((req.body as { active?: unknown }).active);
+      const result = setSurveyQuestionActive(id, active);
+
+      if (!result.ok) {
+        res.status(404).json({
+          success: false,
+          message: "Survey question not found.",
+        });
+        return;
+      }
+
+      res.status(200).json({ success: true, data: { id, active } });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Set survey active error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.post("/api/v1/admin/ads", requireAdminKey, (req: Request, res: Response) => {
+  try {
+    const body = req.body as {
+      headline?: unknown;
+      body?: unknown;
+      cta_label?: unknown;
+      cta_url?: unknown;
+    };
+
+    const created = addAd({
+      headline: typeof body.headline === "string" ? body.headline : "",
+      body: typeof body.body === "string" ? body.body : "",
+      cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
+      cta_url: typeof body.cta_url === "string" ? body.cta_url : "",
+    });
+
+    res.status(201).json({
+      success: true,
+      data: created,
+    });
+  } catch (error) {
+    if (error instanceof ContentValidationError || error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Admin] Add ad error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
+app.patch(
+  "/api/v1/admin/ads/:id/active",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const active = parseActiveFlag((req.body as { active?: unknown }).active);
+      const result = setAdActive(id, active);
+
+      if (!result.ok) {
+        res.status(404).json({
+          success: false,
+          message: "Ad not found.",
+        });
+        return;
+      }
+
+      res.status(200).json({ success: true, data: { id, active } });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Set ad active error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
 
 const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -718,6 +1117,84 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     td { border-top: 1px solid #27272a; }
     .amount { color: #22c55e; font-weight: 600; }
     .empty { color: #71717a; font-style: italic; padding: 20px; text-align: center; }
+    .form-card {
+      background: #141416;
+      border-radius: 10px;
+      padding: 20px;
+      border: 1px solid #27272a;
+      margin-bottom: 16px;
+    }
+    .form-row { margin-bottom: 12px; }
+    .form-row label {
+      display: block;
+      font-size: 0.75rem;
+      color: #a1a1aa;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    input, textarea {
+      width: 100%;
+      background: #0c0c0e;
+      border: 1px solid #27272a;
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #e4e4e7;
+      font-size: 0.875rem;
+      font-family: inherit;
+    }
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: #22c55e;
+    }
+    textarea { resize: vertical; min-height: 60px; }
+    .options-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+    }
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+    .toggle-btn {
+      background: #27272a;
+      color: #e4e4e7;
+      flex-shrink: 0;
+      font-size: 0.75rem;
+      padding: 6px 12px;
+    }
+    .toggle-btn:hover { background: #3f3f46; }
+    .toggle-btn.inactive { background: #450a0a; color: #fca5a5; }
+    .toggle-btn.inactive:hover { background: #7f1d1d; }
+    .status-badge {
+      font-size: 0.75rem;
+      color: #71717a;
+    }
+    .status-badge.inactive { color: #fca5a5; }
+    .btn-sm {
+      font-size: 0.75rem;
+      padding: 6px 12px;
+      margin-right: 6px;
+    }
+    .btn-reject {
+      background: #450a0a;
+      color: #fca5a5;
+    }
+    .btn-reject:hover { background: #7f1d1d; }
+    .badge-pending { color: #fbbf24; }
+    .badge-paid { color: #22c55e; }
+    .badge-rejected { color: #fca5a5; }
+    .history-table { margin-top: 16px; }
+    .history-table h3 {
+      font-size: 0.875rem;
+      color: #a1a1aa;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -737,11 +1214,51 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
   </div>
   <div class="section">
     <h2>Survey Results</h2>
+    <div class="form-card" id="addSurveyForm">
+      <div class="form-row">
+        <label for="surveyQuestion">Question</label>
+        <input type="text" id="surveyQuestion" placeholder="Enter survey question">
+      </div>
+      <div class="form-row">
+        <label>Options (2–4)</label>
+        <div class="options-grid">
+          <input type="text" id="surveyOpt1" placeholder="Option 1">
+          <input type="text" id="surveyOpt2" placeholder="Option 2">
+          <input type="text" id="surveyOpt3" placeholder="Option 3">
+          <input type="text" id="surveyOpt4" placeholder="Option 4">
+        </div>
+      </div>
+      <button type="button" id="addSurveyBtn">Add Question</button>
+    </div>
     <div id="surveyResults"></div>
   </div>
   <div class="section">
     <h2>Ad Performance</h2>
+    <div class="form-card" id="addAdForm">
+      <div class="form-row">
+        <label for="adHeadline">Headline</label>
+        <input type="text" id="adHeadline" placeholder="Ad headline">
+      </div>
+      <div class="form-row">
+        <label for="adBody">Body</label>
+        <textarea id="adBody" placeholder="Ad body text"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="adCtaLabel">CTA Label</label>
+        <input type="text" id="adCtaLabel" placeholder="Button label">
+      </div>
+      <div class="form-row">
+        <label for="adCtaUrl">CTA URL</label>
+        <input type="url" id="adCtaUrl" placeholder="https://example.com">
+      </div>
+      <button type="button" id="addAdBtn">Add Ad</button>
+    </div>
     <div id="adStatsTable"></div>
+  </div>
+  <div class="section">
+    <h2>Redemption Requests</h2>
+    <div id="redemptionsPending"></div>
+    <div id="redemptionsHistory" class="history-table"></div>
   </div>
   <div class="section">
     <h2>Recent Transactions</h2>
@@ -754,7 +1271,8 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       return d.innerHTML;
     }
     function fmtMoney(n) {
-      return "$" + Number(n).toFixed(2);
+      var v = Number(n);
+      return "₹" + (Number.isInteger(v) ? String(v) : v.toFixed(2));
     }
     function fmtTime(iso) {
       try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
@@ -792,12 +1310,22 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
             '<div class="bar-count">' + esc(b.answer) + ' — ' + b.count + '</div>' +
             '</div>';
         }).join("");
-        return '<div class="survey-card">' +
+        var toggleLabel = q.active ? "Disable" : "Enable";
+        var toggleClass = q.active ? "toggle-btn" : "toggle-btn inactive";
+        return '<div class="survey-card" data-id="' + q.id + '">' +
+          '<div class="card-header">' +
           '<div class="survey-question">' + esc(q.question) + '</div>' +
+          '<button type="button" class="' + toggleClass + '" data-survey-id="' + q.id + '" data-active="' + q.active + '">' + toggleLabel + '</button>' +
+          '</div>' +
           '<div class="survey-meta">' + q.totalResponses + ' response' + (q.totalResponses !== 1 ? 's' : '') +
-          (q.active ? '' : ' · inactive') + '</div>' +
+          ' · <span class="status-badge' + (q.active ? '' : ' inactive') + '">' + (q.active ? 'active' : 'inactive') + '</span></div>' +
           bars + '</div>';
       }).join("");
+      container.querySelectorAll("[data-survey-id]").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          toggleSurveyActive(Number(btn.getAttribute("data-survey-id")), btn.getAttribute("data-active") !== "true");
+        });
+      });
     }
     function renderTransactions(transactions) {
       var container = document.getElementById("transactionsTable");
@@ -825,18 +1353,210 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
         var ctr = ad.impressions > 0
           ? ((ad.clicks / ad.impressions) * 100).toFixed(1) + "%"
           : "0%";
-        return '<tr>' +
-          '<td>' + esc(ad.headline) + '</td>' +
+        var toggleLabel = ad.active ? "Disable" : "Enable";
+        var toggleClass = ad.active ? "toggle-btn" : "toggle-btn inactive";
+        return '<tr data-id="' + ad.id + '">' +
+          '<td>' + esc(ad.headline) + ' <span class="status-badge' + (ad.active ? '' : ' inactive') + '">' + (ad.active ? '' : '(inactive)') + '</span></td>' +
           '<td>' + ad.impressions + '</td>' +
           '<td>' + ad.clicks + '</td>' +
           '<td>' + ctr + '</td>' +
+          '<td><button type="button" class="' + toggleClass + '" data-ad-id="' + ad.id + '" data-active="' + ad.active + '">' + toggleLabel + '</button></td>' +
           '</tr>';
       }).join("");
-      container.innerHTML = '<table><thead><tr><th>Headline</th><th>Impressions</th><th>Clicks</th><th>CTR</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      container.innerHTML = '<table><thead><tr><th>Headline</th><th>Impressions</th><th>Clicks</th><th>CTR</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      container.querySelectorAll("[data-ad-id]").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          toggleAdActive(Number(btn.getAttribute("data-ad-id")), btn.getAttribute("data-active") !== "true");
+        });
+      });
+    }
+    function methodLabel(method) {
+      return method === "amazon_voucher" ? "Amazon Pay voucher" : "UPI";
+    }
+    function statusBadge(status) {
+      var cls = "badge-" + status;
+      return '<span class="' + cls + '">' + esc(status) + '</span>';
+    }
+    function renderRedemptions(redemptions) {
+      var pending = redemptions.filter(function(r) { return r.status === "pending"; });
+      var resolved = redemptions.filter(function(r) { return r.status !== "pending"; }).slice(0, 10);
+
+      var pendingContainer = document.getElementById("redemptionsPending");
+      if (!pending.length) {
+        pendingContainer.innerHTML = '<div class="empty">No pending redemption requests.</div>';
+      } else {
+        var pendingRows = pending.map(function(r) {
+          return '<tr data-id="' + r.id + '">' +
+            '<td>' + esc(shortId(r.user_id)) + '</td>' +
+            '<td class="amount">' + esc(fmtMoney(r.amount)) + '</td>' +
+            '<td>' + esc(methodLabel(r.method)) + '</td>' +
+            '<td>' + esc(r.detail) + '</td>' +
+            '<td>' + esc(fmtTime(r.created_at)) + '</td>' +
+            '<td>' +
+            '<button type="button" class="btn-sm" data-resolve-id="' + r.id + '" data-status="paid">Mark Paid</button>' +
+            '<button type="button" class="btn-sm btn-reject" data-resolve-id="' + r.id + '" data-status="rejected">Reject</button>' +
+            '</td></tr>';
+        }).join("");
+        pendingContainer.innerHTML = '<table><thead><tr><th>User</th><th>Amount</th><th>Method</th><th>Detail</th><th>Date</th><th>Actions</th></tr></thead><tbody>' + pendingRows + '</tbody></table>';
+        pendingContainer.querySelectorAll("[data-resolve-id]").forEach(function(btn) {
+          btn.addEventListener("click", function() {
+            resolveRedemption(Number(btn.getAttribute("data-resolve-id")), btn.getAttribute("data-status"));
+          });
+        });
+      }
+
+      var historyContainer = document.getElementById("redemptionsHistory");
+      if (!resolved.length) {
+        historyContainer.innerHTML = '';
+      } else {
+        var historyRows = resolved.map(function(r) {
+          return '<tr>' +
+            '<td>' + esc(shortId(r.user_id)) + '</td>' +
+            '<td class="amount">' + esc(fmtMoney(r.amount)) + '</td>' +
+            '<td>' + esc(methodLabel(r.method)) + '</td>' +
+            '<td>' + statusBadge(r.status) + '</td>' +
+            '<td>' + esc(fmtTime(r.resolved_at || r.created_at)) + '</td>' +
+            '</tr>';
+        }).join("");
+        historyContainer.innerHTML = '<h3>Recently Resolved</h3><table><thead><tr><th>User</th><th>Amount</th><th>Method</th><th>Status</th><th>Resolved</th></tr></thead><tbody>' + historyRows + '</tbody></table>';
+      }
+    }
+    async function resolveRedemption(id, status) {
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/redemptions/" + id + "/resolve"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: status }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to resolve redemption.");
+        }
+        await loadRedemptions();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to resolve redemption.");
+      }
+    }
+    async function loadRedemptions() {
+      var response = await fetch(adminUrl("/api/v1/admin/redemptions"));
+      if (!response.ok) throw new Error("Failed to load redemptions.");
+      var json = await response.json();
+      if (!json.success) throw new Error("API returned an error response.");
+      renderRedemptions(json.data.redemptions);
     }
     function adminUrl(path) {
       var key = new URLSearchParams(window.location.search).get("key");
       return key ? path + "?key=" + encodeURIComponent(key) : path;
+    }
+    async function loadSurveys() {
+      var response = await fetch(adminUrl("/api/v1/admin/surveys"));
+      if (!response.ok) throw new Error("Failed to load surveys.");
+      var json = await response.json();
+      if (!json.success) throw new Error("API returned an error response.");
+      renderSurveys(json.data.results);
+    }
+    async function loadAds() {
+      var response = await fetch(adminUrl("/api/v1/admin/ads"));
+      if (!response.ok) throw new Error("Failed to load ads.");
+      var json = await response.json();
+      if (!json.success) throw new Error("API returned an error response.");
+      renderAdStats(json.data);
+    }
+    async function toggleSurveyActive(id, active) {
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/surveys/" + id + "/active"), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ active: active }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to update survey.");
+        }
+        await loadSurveys();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to update survey.");
+      }
+    }
+    async function toggleAdActive(id, active) {
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/ads/" + id + "/active"), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ active: active }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to update ad.");
+        }
+        await loadAds();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to update ad.");
+      }
+    }
+    async function submitSurvey() {
+      var btn = document.getElementById("addSurveyBtn");
+      btn.disabled = true;
+      hideError();
+      try {
+        var options = ["surveyOpt1", "surveyOpt2", "surveyOpt3", "surveyOpt4"]
+          .map(function(id) { return document.getElementById(id).value.trim(); })
+          .filter(function(v) { return v.length > 0; });
+        var response = await fetch(adminUrl("/api/v1/admin/surveys"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: document.getElementById("surveyQuestion").value,
+            options: options,
+          }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to add survey question.");
+        }
+        document.getElementById("surveyQuestion").value = "";
+        ["surveyOpt1", "surveyOpt2", "surveyOpt3", "surveyOpt4"].forEach(function(id) {
+          document.getElementById(id).value = "";
+        });
+        await loadSurveys();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to add survey question.");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    async function submitAd() {
+      var btn = document.getElementById("addAdBtn");
+      btn.disabled = true;
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/ads"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            headline: document.getElementById("adHeadline").value,
+            body: document.getElementById("adBody").value,
+            cta_label: document.getElementById("adCtaLabel").value,
+            cta_url: document.getElementById("adCtaUrl").value,
+          }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to add ad.");
+        }
+        document.getElementById("adHeadline").value = "";
+        document.getElementById("adBody").value = "";
+        document.getElementById("adCtaLabel").value = "";
+        document.getElementById("adCtaUrl").value = "";
+        await loadAds();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to add ad.");
+      } finally {
+        btn.disabled = false;
+      }
     }
     async function loadDashboard() {
       var btn = document.getElementById("refreshBtn");
@@ -848,20 +1568,23 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
           fetch(adminUrl("/api/v1/admin/surveys")),
           fetch(adminUrl("/api/v1/admin/transactions")),
           fetch(adminUrl("/api/v1/admin/ads")),
+          fetch(adminUrl("/api/v1/admin/redemptions")),
         ]);
-        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok) {
+        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok) {
           throw new Error("One or more API requests failed.");
         }
         var statsJson = await responses[0].json();
         var surveysJson = await responses[1].json();
         var txJson = await responses[2].json();
         var adsJson = await responses[3].json();
-        if (!statsJson.success || !surveysJson.success || !txJson.success || !adsJson.success) {
+        var redemptionsJson = await responses[4].json();
+        if (!statsJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success) {
           throw new Error("API returned an error response.");
         }
         renderStats(statsJson.data);
         renderSurveys(surveysJson.data.results);
         renderAdStats(adsJson.data);
+        renderRedemptions(redemptionsJson.data.redemptions);
         renderTransactions(txJson.data.transactions);
       } catch (err) {
         showError(err instanceof Error ? err.message : "Failed to load dashboard data.");
@@ -873,6 +1596,8 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       window.location.href = adminUrl("/api/v1/admin/backup");
     });
     document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
+    document.getElementById("addSurveyBtn").addEventListener("click", submitSurvey);
+    document.getElementById("addAdBtn").addEventListener("click", submitAd);
     loadDashboard();
   </script>
 </body>

@@ -1,4 +1,5 @@
-// Switch to http://localhost:3001 for local development.
+// Local dev: set API_BASE_URL to http://localhost:3001 and re-add
+// "http://localhost:3001/*" to host_permissions in public/manifest.json.
 const API_BASE_URL = "https://omni-protocol-ai-waittime-production.up.railway.app";
 const API_BASE = `${API_BASE_URL}/api/v1`;
 const HEALTH_URL = `${API_BASE_URL}/health`;
@@ -7,6 +8,30 @@ const EARNINGS_KEY = "omniEarnings";
 const USER_ID_KEY = "omniUserId";
 
 let cachedUserId: string | null = null;
+
+export interface RewardConfig {
+  currency: string;
+  symbol: string;
+  tier2Amount: number;
+  tier3Amount: number;
+  minRedemption: number;
+  minWaitSeconds: number;
+  tier3Seconds: number;
+}
+
+const DEFAULT_REWARD_CONFIG: RewardConfig = {
+  currency: "INR",
+  symbol: "₹",
+  tier2Amount: 2,
+  tier3Amount: 10,
+  minRedemption: 100,
+  minWaitSeconds: 5,
+  tier3Seconds: 15,
+};
+
+const CONFIG_TTL_MS = 10 * 60 * 1000;
+let cachedRewardConfig: RewardConfig | null = null;
+let configFetchedAt = 0;
 
 export interface ClaimYieldPayload {
   userId: string;
@@ -29,12 +54,34 @@ interface Transaction {
   created_at: string;
 }
 
+interface Redemption {
+  id: number;
+  user_id: string;
+  amount: number;
+  method: string;
+  detail: string;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 type ApiMessage =
   | { type: "SESSION_START"; payload?: undefined }
   | { type: "CLAIM_YIELD"; payload: ClaimYieldClientPayload }
   | { type: "GET_SURVEY"; payload?: undefined }
+  | { type: "GET_AD"; payload?: undefined }
+  | {
+      type: "AD_EVENT";
+      payload: { adId: number; event: "impression" | "click" };
+    }
   | { type: "GET_WALLET"; payload?: { limit?: number } }
-  | { type: "GET_HEALTH"; payload?: undefined };
+  | { type: "GET_HEALTH"; payload?: undefined }
+  | {
+      type: "REDEEM";
+      payload: { method: "amazon_voucher" | "upi"; detail: string };
+    }
+  | { type: "GET_REDEMPTIONS"; payload?: undefined }
+  | { type: "GET_CONFIG"; payload?: undefined };
 
 type ApiResponse =
   | { ok: true; data: unknown; status?: number }
@@ -112,6 +159,22 @@ export function getSurveyNext(userId: string): Promise<unknown> {
   return requestJson(`${API_BASE}/survey/next/${encodeURIComponent(userId)}`);
 }
 
+export function getAdNext(): Promise<unknown> {
+  return requestJson(`${API_BASE}/ad/next`);
+}
+
+export function postAdEvent(
+  adId: number,
+  userId: string,
+  event: "impression" | "click",
+): Promise<unknown> {
+  return requestJson(`${API_BASE}/ad/event`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ adId, userId, event }),
+  });
+}
+
 export function getTransactions(
   userId: string,
   limit: number,
@@ -120,6 +183,70 @@ export function getTransactions(
   return requestJson(
     `${API_BASE}/transactions/${encodeURIComponent(userId)}?${params}`,
   );
+}
+
+export function postRedeem(
+  userId: string,
+  method: "amazon_voucher" | "upi",
+  detail: string,
+): Promise<unknown> {
+  return requestJson(`${API_BASE}/redeem`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId, method, detail }),
+  });
+}
+
+export function getRedemptions(userId: string): Promise<unknown> {
+  return requestJson(
+    `${API_BASE}/redemptions/${encodeURIComponent(userId)}`,
+  );
+}
+
+function parseConfigResponse(json: unknown): RewardConfig {
+  const raw =
+    typeof json === "object" && json !== null
+      ? ((json as Record<string, unknown>).data ?? json)
+      : null;
+
+  if (typeof raw !== "object" || raw === null) {
+    return DEFAULT_REWARD_CONFIG;
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const pick = <K extends keyof RewardConfig>(
+    key: K,
+    fallback: RewardConfig[K],
+  ): RewardConfig[K] => {
+    const value = obj[key];
+    return typeof value === typeof fallback ? (value as RewardConfig[K]) : fallback;
+  };
+
+  return {
+    currency: pick("currency", DEFAULT_REWARD_CONFIG.currency),
+    symbol: pick("symbol", DEFAULT_REWARD_CONFIG.symbol),
+    tier2Amount: pick("tier2Amount", DEFAULT_REWARD_CONFIG.tier2Amount),
+    tier3Amount: pick("tier3Amount", DEFAULT_REWARD_CONFIG.tier3Amount),
+    minRedemption: pick("minRedemption", DEFAULT_REWARD_CONFIG.minRedemption),
+    minWaitSeconds: pick("minWaitSeconds", DEFAULT_REWARD_CONFIG.minWaitSeconds),
+    tier3Seconds: pick("tier3Seconds", DEFAULT_REWARD_CONFIG.tier3Seconds),
+  };
+}
+
+export async function getRewardConfig(): Promise<RewardConfig> {
+  if (cachedRewardConfig && Date.now() - configFetchedAt < CONFIG_TTL_MS) {
+    return cachedRewardConfig;
+  }
+
+  try {
+    const json = await requestJson<unknown>(`${API_BASE}/config`);
+    const config = parseConfigResponse(json);
+    cachedRewardConfig = config;
+    configFetchedAt = Date.now();
+    return config;
+  } catch {
+    return DEFAULT_REWARD_CONFIG;
+  }
 }
 
 export async function getHealth(): Promise<unknown> {
@@ -164,6 +291,21 @@ function parseTransactionsResponse(json: unknown): Transaction[] {
   }
 
   throw new BackendError("Unexpected transactions response shape");
+}
+
+function parseRedemptionsResponse(json: unknown): Redemption[] {
+  if (typeof json === "object" && json !== null) {
+    const obj = json as Record<string, unknown>;
+    if (Array.isArray(obj.redemptions)) return obj.redemptions as Redemption[];
+    if (typeof obj.data === "object" && obj.data !== null) {
+      const data = obj.data as Record<string, unknown>;
+      if (Array.isArray(data.redemptions)) {
+        return data.redemptions as Redemption[];
+      }
+    }
+  }
+
+  throw new BackendError("Unexpected redemptions response shape");
 }
 
 function storageGetNumber(key: string): Promise<number> {
@@ -226,6 +368,19 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
     case "GET_SURVEY":
       return { ok: true, data: await getSurveyNext(userId) };
 
+    case "GET_AD":
+      return { ok: true, data: await getAdNext() };
+
+    case "AD_EVENT":
+      return {
+        ok: true,
+        data: await postAdEvent(
+          message.payload.adId,
+          userId,
+          message.payload.event,
+        ),
+      };
+
     case "GET_WALLET": {
       const limit = message.payload?.limit ?? 10;
       const [balanceJson, transactionsJson] = await Promise.all([
@@ -244,6 +399,23 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
 
     case "GET_HEALTH":
       return { ok: true, data: await getHealth() };
+
+    case "REDEEM": {
+      const data = await postRedeem(userId, message.payload.method, message.payload.detail);
+      await storageSet({ [EARNINGS_KEY]: 0 });
+      return { ok: true, data };
+    }
+
+    case "GET_REDEMPTIONS":
+      return {
+        ok: true,
+        data: {
+          redemptions: parseRedemptionsResponse(await getRedemptions(userId)),
+        },
+      };
+
+    case "GET_CONFIG":
+      return { ok: true, data: await getRewardConfig() };
   }
 }
 
