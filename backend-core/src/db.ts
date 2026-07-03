@@ -439,3 +439,11 @@ export function getLedgerStats(): LedgerStats {
 export function getRecentTransactions(limit = 20): RecentTransaction[] {
   return selectRecentTransactions.all(limit) as RecentTransaction[];
 }
+
+export function getDbPath(): string {
+  return DB_PATH;
+}
+
+export function backupDatabase(destPath: string): Promise<Database.BackupMetadata> {
+  return db.backup(destPath);
+}

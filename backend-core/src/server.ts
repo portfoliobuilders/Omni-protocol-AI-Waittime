@@ -1,8 +1,12 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   applyYield,
+  backupDatabase,
   consumeClaimSession,
   createClaimSession,
   DuplicateTransactionError,
@@ -400,6 +404,32 @@ app.get("/api/v1/admin/transactions", requireAdminKey, (_req: Request, res: Resp
   });
 });
 
+app.get("/api/v1/admin/backup", requireAdminKey, async (_req: Request, res: Response) => {
+  const tempPath = path.join(os.tmpdir(), `omni-backup-${Date.now()}.db`);
+  const downloadName = `omni-ledger-backup-${new Date().toISOString().slice(0, 10)}.db`;
+
+  try {
+    await backupDatabase(tempPath);
+    res.download(tempPath, downloadName, (err) => {
+      fs.unlink(tempPath, () => {});
+      if (err && !res.headersSent) {
+        console.error("[Omni Admin] Backup download error", err);
+        res.status(500).json({
+          success: false,
+          message: "Internal server error.",
+        });
+      }
+    });
+  } catch (error) {
+    fs.unlink(tempPath, () => {});
+    console.error("[Omni Admin] Backup error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -420,6 +450,10 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       margin-bottom: 24px;
+    }
+    .header-actions {
+      display: flex;
+      gap: 8px;
     }
     h1 { font-size: 1.5rem; font-weight: 600; color: #fafafa; }
     h2 {
@@ -555,7 +589,10 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <header>
     <h1>Omni Admin Dashboard</h1>
-    <button id="refreshBtn" type="button">Refresh</button>
+    <div class="header-actions">
+      <button id="backupBtn" type="button">Download Backup</button>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
   </header>
   <div id="error" class="error"></div>
   <div class="stats-row" id="statsRow">
@@ -672,6 +709,9 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
         btn.disabled = false;
       }
     }
+    document.getElementById("backupBtn").addEventListener("click", function() {
+      window.location.href = adminUrl("/api/v1/admin/backup");
+    });
     document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
     loadDashboard();
   </script>
