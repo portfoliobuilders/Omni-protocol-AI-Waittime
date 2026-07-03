@@ -85,7 +85,22 @@ db.exec(`
     resolved_at TEXT,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
   );
+
+  CREATE TABLE IF NOT EXISTS partners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    partner_key TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
+
+const transactionColumns = db.pragma("table_info(transactions)") as Array<{
+  name: string;
+}>;
+if (!transactionColumns.some((column) => column.name === "partner_id")) {
+  db.exec(`ALTER TABLE transactions ADD COLUMN partner_id INTEGER`);
+}
 
 const surveyQuestionCount = db
   .prepare(`SELECT COUNT(*) AS count FROM survey_questions`)
@@ -163,8 +178,8 @@ const upsertUser = db.prepare(`
 `);
 
 const insertTx = db.prepare(`
-  INSERT INTO transactions (user_id, amount, layer, nonce)
-  VALUES (@userId, @amount, @layer, @nonce)
+  INSERT INTO transactions (user_id, amount, layer, nonce, partner_id)
+  VALUES (@userId, @amount, @layer, @nonce, @partnerId)
 `);
 
 const creditBalance = db.prepare(`
@@ -193,10 +208,19 @@ export class DuplicateTransactionError extends Error {
 }
 
 export const applyYield = db.transaction(
-  (input: { userId: string; amount: number; layer: string; nonce: string }) => {
+  (input: {
+    userId: string;
+    amount: number;
+    layer: string;
+    nonce: string;
+    partnerId?: number;
+  }) => {
     upsertUser.run(input.userId);
     try {
-      insertTx.run(input);
+      insertTx.run({
+        ...input,
+        partnerId: input.partnerId ?? null,
+      });
     } catch (err: unknown) {
       if (
         err instanceof Error &&
@@ -872,3 +896,104 @@ export const resetLedger = db.transaction(() => {
     UPDATE users SET balance = 0;
   `);
 });
+
+export interface Partner {
+  id: number;
+  partner_key: string;
+  name: string;
+}
+
+export interface PartnerStat {
+  id: number;
+  partner_key: string;
+  name: string;
+  active: boolean;
+  transactions: number;
+  totalPaid: number;
+}
+
+const insertPartner = db.prepare(`
+  INSERT INTO partners (partner_key, name)
+  VALUES (?, ?)
+`);
+
+const selectPartnerByKey = db.prepare(`
+  SELECT id, partner_key, name
+  FROM partners
+  WHERE partner_key = ? AND active = 1
+`);
+
+const updatePartnerActive = db.prepare(`
+  UPDATE partners SET active = ? WHERE id = ?
+`);
+
+const selectPartnerStats = db.prepare(`
+  SELECT
+    p.id,
+    p.partner_key,
+    p.name,
+    p.active,
+    COALESCE(COUNT(t.id), 0) AS transactions,
+    COALESCE(SUM(t.amount), 0) AS totalPaid
+  FROM partners p
+  LEFT JOIN transactions t ON t.partner_id = p.id
+  GROUP BY p.id, p.partner_key, p.name, p.active
+  ORDER BY p.id ASC
+`);
+
+export function createPartner(name: string): Partner {
+  const trimmedName = name.trim();
+
+  if (!trimmedName) {
+    throw new ContentValidationError("name must be a non-empty string.");
+  }
+
+  const partner_key = `pk_${crypto.randomUUID()}`;
+  const result = insertPartner.run(partner_key, trimmedName);
+
+  return {
+    id: Number(result.lastInsertRowid),
+    partner_key,
+    name: trimmedName,
+  };
+}
+
+export function getPartnerByKey(key: string): Partner | null {
+  const row = selectPartnerByKey.get(key) as Partner | undefined;
+  return row ?? null;
+}
+
+export type SetPartnerActiveResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" };
+
+export function setPartnerActive(
+  id: number,
+  active: boolean,
+): SetPartnerActiveResult {
+  const result = updatePartnerActive.run(active ? 1 : 0, id);
+  if (result.changes === 0) {
+    return { ok: false, reason: "not_found" };
+  }
+  return { ok: true };
+}
+
+export function getPartnerStats(): PartnerStat[] {
+  const rows = selectPartnerStats.all() as Array<{
+    id: number;
+    partner_key: string;
+    name: string;
+    active: number;
+    transactions: number;
+    totalPaid: number;
+  }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    partner_key: row.partner_key,
+    name: row.name,
+    active: row.active === 1,
+    transactions: row.transactions,
+    totalPaid: row.totalPaid,
+  }));
+}

@@ -12,12 +12,15 @@ import {
   consumeClaimSession,
   ContentValidationError,
   createClaimSession,
+  createPartner,
   DuplicateTransactionError,
   getActiveAd,
   getAdStats,
   getBalance,
   getLedgerStats,
   getNextSurveyQuestion,
+  getPartnerByKey,
+  getPartnerStats,
   getRecentTransactions,
   getRedemptions,
   getSurveyResults,
@@ -29,6 +32,7 @@ import {
   resetLedger,
   resolveRedemption,
   setAdActive,
+  setPartnerActive,
   setSurveyQuestionActive,
 } from "./db";
 
@@ -67,10 +71,12 @@ interface YieldRequestBody {
   sessionToken?: unknown;
   surveyQuestionId?: unknown;
   surveyAnswer?: unknown;
+  partnerKey?: unknown;
 }
 
 interface SessionStartRequestBody {
   userId?: unknown;
+  partnerKey?: unknown;
 }
 
 interface AdEventRequestBody {
@@ -126,6 +132,41 @@ function parseUserId(userIdValue: unknown): string {
   }
 
   return userId;
+}
+
+function parseOptionalPartnerKey(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  const partnerKey = typeof value === "string" ? value.trim() : "";
+
+  if (!partnerKey) {
+    return undefined;
+  }
+
+  return partnerKey;
+}
+
+function resolvePartnerId(
+  partnerKey: string | undefined,
+  res: Response,
+): number | undefined | null {
+  if (!partnerKey) {
+    return undefined;
+  }
+
+  const partner = getPartnerByKey(partnerKey);
+
+  if (!partner) {
+    res.status(403).json({
+      success: false,
+      message: "Invalid partner key",
+    });
+    return null;
+  }
+
+  return partner.id;
 }
 
 function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
@@ -217,6 +258,27 @@ class ValidationError extends Error {
   }
 }
 
+function resolveOmniSdkPath(): string | null {
+  const candidates: string[] = [];
+
+  if (process.env.OMNI_SDK_PATH) {
+    candidates.push(path.resolve(process.env.OMNI_SDK_PATH));
+  }
+
+  candidates.push(
+    path.resolve(__dirname, "../public/sdk/omni.min.js"),
+    path.resolve(__dirname, "../../b2b-sdk/dist/omni.min.js"),
+  );
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function requireAdminKey(
   req: Request,
   res: Response,
@@ -251,6 +313,22 @@ app.get("/api/v1/config", (_req: Request, res: Response) => {
     success: true,
     data: { ...REWARD_ECONOMICS },
   });
+});
+
+app.get("/sdk/omni.min.js", (_req: Request, res: Response) => {
+  const sdkPath = resolveOmniSdkPath();
+
+  if (!sdkPath) {
+    res.status(404).json({
+      success: false,
+      message: "SDK bundle not found.",
+    });
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/javascript");
+  res.setHeader("Cache-Control", "max-age=3600");
+  res.sendFile(sdkPath);
 });
 
 app.get("/privacy", (_req: Request, res: Response) => {
@@ -314,7 +392,14 @@ app.get("/privacy", (_req: Request, res: Response) => {
 
 app.post("/api/v1/session/start", (req: Request, res: Response) => {
   try {
-    const userId = parseUserId((req.body as SessionStartRequestBody).userId);
+    const body = req.body as SessionStartRequestBody;
+    const partnerKey = parseOptionalPartnerKey(body.partnerKey);
+    const partnerId = resolvePartnerId(partnerKey, res);
+    if (partnerId === null) {
+      return;
+    }
+
+    const userId = parseUserId(body.userId);
     const sessionToken = createClaimSession(userId);
 
     res.status(200).json({
@@ -366,6 +451,14 @@ app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
 
 app.post("/api/v1/yield", (req: Request, res: Response) => {
   try {
+    const partnerKey = parseOptionalPartnerKey(
+      (req.body as YieldRequestBody).partnerKey,
+    );
+    const partnerId = resolvePartnerId(partnerKey, res);
+    if (partnerId === null) {
+      return;
+    }
+
     const transaction = parseYieldRequest(req.body as YieldRequestBody);
     const isSurveyClaim =
       transaction.surveyQuestionId !== undefined &&
@@ -427,6 +520,7 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
       amount: creditedAmount,
       layer: transaction.layer,
       nonce: transaction.nonce,
+      ...(partnerId !== undefined ? { partnerId } : {}),
     });
 
     console.info("[Omni Yield] Transaction accepted", {
@@ -963,6 +1057,77 @@ app.patch(
   },
 );
 
+app.post("/api/v1/admin/partners", requireAdminKey, (req: Request, res: Response) => {
+  try {
+    const name = typeof (req.body as { name?: unknown }).name === "string"
+      ? (req.body as { name: string }).name
+      : "";
+    const created = createPartner(name);
+
+    res.status(201).json({
+      success: true,
+      data: created,
+    });
+  } catch (error) {
+    if (error instanceof ContentValidationError || error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Admin] Add partner error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
+app.get("/api/v1/admin/partners", requireAdminKey, (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    data: getPartnerStats(),
+  });
+});
+
+app.patch(
+  "/api/v1/admin/partners/:id/active",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const active = parseActiveFlag((req.body as { active?: unknown }).active);
+      const result = setPartnerActive(id, active);
+
+      if (!result.ok) {
+        res.status(404).json({
+          success: false,
+          message: "Partner not found.",
+        });
+        return;
+      }
+
+      res.status(200).json({ success: true, data: { id, active } });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Set partner active error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
 const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1040,6 +1205,12 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       color: #22c55e;
     }
     .section { margin-bottom: 32px; }
+    .partner-key {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.75rem;
+      color: #a1a1aa;
+      word-break: break-all;
+    }
     .survey-card {
       background: #141416;
       border-radius: 10px;
@@ -1213,6 +1384,17 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="stat-card"><div class="stat-label">Survey Responses</div><div class="stat-value" id="statSurvey">—</div></div>
   </div>
   <div class="section">
+    <h2>Partners</h2>
+    <div class="form-card" id="addPartnerForm">
+      <div class="form-row">
+        <label for="partnerName">Partner name</label>
+        <input type="text" id="partnerName" placeholder="Acme Corp">
+      </div>
+      <button type="button" id="addPartnerBtn">Add Partner</button>
+    </div>
+    <div id="partnersTable"></div>
+  </div>
+  <div class="section">
     <h2>Survey Results</h2>
     <div class="form-card" id="addSurveyForm">
       <div class="form-row">
@@ -1293,6 +1475,30 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById("statTx").textContent = data.totalTransactions;
       document.getElementById("statPaid").textContent = fmtMoney(data.totalPaidOut);
       document.getElementById("statSurvey").textContent = data.totalSurveyResponses;
+    }
+    function renderPartners(partners) {
+      var container = document.getElementById("partnersTable");
+      if (!partners.length) {
+        container.innerHTML = '<div class="empty">No partners yet.</div>';
+        return;
+      }
+      var rows = partners.map(function(p) {
+        var toggleLabel = p.active ? "Disable" : "Enable";
+        var toggleClass = p.active ? "toggle-btn" : "toggle-btn inactive";
+        return '<tr data-id="' + p.id + '">' +
+          '<td>' + esc(p.name) + ' <span class="status-badge' + (p.active ? '' : ' inactive') + '">' + (p.active ? '' : '(inactive)') + '</span></td>' +
+          '<td class="partner-key">' + esc(p.partner_key) + '</td>' +
+          '<td>' + p.transactions + '</td>' +
+          '<td class="amount">' + esc(fmtMoney(p.totalPaid)) + '</td>' +
+          '<td><button type="button" class="' + toggleClass + '" data-partner-id="' + p.id + '" data-active="' + p.active + '">' + toggleLabel + '</button></td>' +
+          '</tr>';
+      }).join("");
+      container.innerHTML = '<table><thead><tr><th>Name</th><th>Key</th><th>Transactions</th><th>Total Paid</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      container.querySelectorAll("[data-partner-id]").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          togglePartnerActive(Number(btn.getAttribute("data-partner-id")), btn.getAttribute("data-active") !== "true");
+        });
+      });
     }
     function renderSurveys(results) {
       var container = document.getElementById("surveyResults");
@@ -1449,6 +1655,54 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       var key = new URLSearchParams(window.location.search).get("key");
       return key ? path + "?key=" + encodeURIComponent(key) : path;
     }
+    async function loadPartners() {
+      var response = await fetch(adminUrl("/api/v1/admin/partners"));
+      if (!response.ok) throw new Error("Failed to load partners.");
+      var json = await response.json();
+      if (!json.success) throw new Error("API returned an error response.");
+      renderPartners(json.data);
+    }
+    async function togglePartnerActive(id, active) {
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/partners/" + id + "/active"), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ active: active }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to update partner.");
+        }
+        await loadPartners();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to update partner.");
+      }
+    }
+    async function submitPartner() {
+      var btn = document.getElementById("addPartnerBtn");
+      btn.disabled = true;
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/partners"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: document.getElementById("partnerName").value,
+          }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to add partner.");
+        }
+        document.getElementById("partnerName").value = "";
+        await loadPartners();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to add partner.");
+      } finally {
+        btn.disabled = false;
+      }
+    }
     async function loadSurveys() {
       var response = await fetch(adminUrl("/api/v1/admin/surveys"));
       if (!response.ok) throw new Error("Failed to load surveys.");
@@ -1565,23 +1819,26 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       try {
         var responses = await Promise.all([
           fetch(adminUrl("/api/v1/admin/stats")),
+          fetch(adminUrl("/api/v1/admin/partners")),
           fetch(adminUrl("/api/v1/admin/surveys")),
           fetch(adminUrl("/api/v1/admin/transactions")),
           fetch(adminUrl("/api/v1/admin/ads")),
           fetch(adminUrl("/api/v1/admin/redemptions")),
         ]);
-        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok) {
+        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok || !responses[5].ok) {
           throw new Error("One or more API requests failed.");
         }
         var statsJson = await responses[0].json();
-        var surveysJson = await responses[1].json();
-        var txJson = await responses[2].json();
-        var adsJson = await responses[3].json();
-        var redemptionsJson = await responses[4].json();
-        if (!statsJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success) {
+        var partnersJson = await responses[1].json();
+        var surveysJson = await responses[2].json();
+        var txJson = await responses[3].json();
+        var adsJson = await responses[4].json();
+        var redemptionsJson = await responses[5].json();
+        if (!statsJson.success || !partnersJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success) {
           throw new Error("API returned an error response.");
         }
         renderStats(statsJson.data);
+        renderPartners(partnersJson.data);
         renderSurveys(surveysJson.data.results);
         renderAdStats(adsJson.data);
         renderRedemptions(redemptionsJson.data.redemptions);
@@ -1598,6 +1855,7 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
     document.getElementById("addSurveyBtn").addEventListener("click", submitSurvey);
     document.getElementById("addAdBtn").addEventListener("click", submitAd);
+    document.getElementById("addPartnerBtn").addEventListener("click", submitPartner);
     loadDashboard();
   </script>
 </body>
