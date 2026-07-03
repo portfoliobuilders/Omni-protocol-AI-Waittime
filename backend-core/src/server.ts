@@ -119,6 +119,97 @@ app.use(
 
 app.use(express.json({ limit: "16kb" }));
 
+// In-memory POST rate limiter (resets on process restart; move to Redis at scale).
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_POSTS = 30;
+const rateLimitByIp = new Map<string, number[]>();
+const RATE_LIMITED_POST_PATHS = new Set([
+  "/api/v1/session/start",
+  "/api/v1/yield",
+  "/api/v1/redeem",
+  "/api/v1/ad/event",
+]);
+
+function postRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  if (req.method !== "POST") {
+    next();
+    return;
+  }
+
+  if (req.path.startsWith("/admin") || req.path.startsWith("/api/v1/admin")) {
+    next();
+    return;
+  }
+
+  if (!RATE_LIMITED_POST_PATHS.has(req.path)) {
+    next();
+    return;
+  }
+
+  const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+  const now = Date.now();
+  const recent = (rateLimitByIp.get(ip) ?? []).filter(
+    (ts) => now - ts < RATE_LIMIT_WINDOW_MS,
+  );
+
+  if (recent.length >= RATE_LIMIT_MAX_POSTS) {
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again later.",
+    });
+    return;
+  }
+
+  recent.push(now);
+  rateLimitByIp.set(ip, recent);
+  next();
+}
+
+app.use(postRateLimiter);
+
+type RouteHandler = (req: Request, res: Response) => void | Promise<void>;
+
+function safeRoute(handler: RouteHandler): RouteHandler {
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      if (error instanceof DuplicateTransactionError) {
+        res.status(200).json({
+          success: true,
+          duplicate: true,
+          message: error.message,
+        });
+        return;
+      }
+
+      if (error instanceof ContentValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni] Unexpected route error", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          message: "Internal server error.",
+        });
+      }
+    }
+  };
+}
+
 function parseUserId(userIdValue: unknown): string {
   const userId =
     typeof userIdValue === "string" ? userIdValue.trim() : "";
@@ -143,6 +234,10 @@ function parseOptionalPartnerKey(value: unknown): string | undefined {
 
   if (!partnerKey) {
     return undefined;
+  }
+
+  if (partnerKey.length > 128) {
+    throw new ValidationError("partnerKey must be 128 characters or fewer.");
   }
 
   return partnerKey;
@@ -214,6 +309,10 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
     );
   }
 
+  if (sessionToken.length > 128) {
+    throw new ValidationError("sessionToken must be 128 characters or fewer.");
+  }
+
   const hasSurveyQuestionId = body.surveyQuestionId !== undefined;
   const hasSurveyAnswer = body.surveyAnswer !== undefined;
 
@@ -239,6 +338,10 @@ function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
     throw new ValidationError(
       "surveyAnswer must be a non-empty string when provided.",
     );
+  }
+
+  if (hasSurveyAnswer && surveyAnswer.length > 256) {
+    throw new ValidationError("surveyAnswer must be 256 characters or fewer.");
   }
 
   return {
@@ -286,6 +389,31 @@ function requireAdminKey(
 ): void {
   if (!ADMIN_KEY) {
     next();
+    return;
+  }
+
+  if (req.query.key === ADMIN_KEY) {
+    next();
+    return;
+  }
+
+  res.status(401).json({
+    success: false,
+    message: "Unauthorized",
+  });
+}
+
+/** Dangerous admin routes: always require OMNI_ADMIN_KEY; 403 when unset. */
+function requireStrictAdminKey(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!ADMIN_KEY) {
+    res.status(403).json({
+      success: false,
+      message: "Forbidden",
+    });
     return;
   }
 
@@ -568,33 +696,35 @@ app.post("/api/v1/yield", (req: Request, res: Response) => {
   }
 });
 
-app.get("/api/v1/balance/:userId", (req: Request, res: Response) => {
+app.get("/api/v1/balance/:userId", safeRoute((req, res) => {
+  const userId = parseUserId(req.params.userId);
   res.status(200).json({
     success: true,
     data: {
-      userId: req.params.userId,
-      balance: getBalance(req.params.userId),
+      userId,
+      balance: getBalance(userId),
     },
   });
-});
+}));
 
-app.get("/api/v1/transactions/:userId", (req: Request, res: Response) => {
+app.get("/api/v1/transactions/:userId", safeRoute((req, res) => {
+  const userId = parseUserId(req.params.userId);
   const limit = Math.min(Number(req.query.limit) || 25, 100);
   res.status(200).json({
     success: true,
     data: {
-      userId: req.params.userId,
-      transactions: getTransactions(req.params.userId, limit),
+      userId,
+      transactions: getTransactions(userId, limit),
     },
   });
-});
+}));
 
-app.get("/api/v1/ad/next", (_req: Request, res: Response) => {
+app.get("/api/v1/ad/next", safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: { ad: getActiveAd() },
   });
-});
+}));
 
 app.post("/api/v1/ad/event", (req: Request, res: Response) => {
   try {
@@ -725,35 +855,35 @@ app.get("/api/v1/redemptions/:userId", (req: Request, res: Response) => {
   }
 });
 
-app.get("/api/v1/admin/stats", requireAdminKey, (_req: Request, res: Response) => {
+app.get("/api/v1/admin/stats", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: getLedgerStats(),
   });
-});
+}));
 
-app.get("/api/v1/admin/surveys", requireAdminKey, (_req: Request, res: Response) => {
+app.get("/api/v1/admin/surveys", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: { results: getSurveyResults() },
   });
-});
+}));
 
-app.get("/api/v1/admin/transactions", requireAdminKey, (_req: Request, res: Response) => {
+app.get("/api/v1/admin/transactions", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: { transactions: getRecentTransactions(20) },
   });
-});
+}));
 
-app.get("/api/v1/admin/ads", requireAdminKey, (_req: Request, res: Response) => {
+app.get("/api/v1/admin/ads", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: getAdStats(),
   });
-});
+}));
 
-app.get("/api/v1/admin/redemptions", requireAdminKey, (req: Request, res: Response) => {
+app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
   const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
   const status =
     statusParam === "pending" || statusParam === "paid" || statusParam === "rejected"
@@ -764,7 +894,7 @@ app.get("/api/v1/admin/redemptions", requireAdminKey, (req: Request, res: Respon
     success: true,
     data: { redemptions: getRedemptions(status) },
   });
-});
+}));
 
 app.post(
   "/api/v1/admin/redemptions/:id/resolve",
@@ -809,21 +939,13 @@ app.post(
   },
 );
 
-app.post("/api/v1/admin/reset-ledger", requireAdminKey, (_req: Request, res: Response) => {
-  try {
-    resetLedger();
-    res.status(200).json({
-      success: true,
-      message: "Ledger reset: transactions, redemptions, ad events, and survey responses cleared; user balances zeroed.",
-    });
-  } catch (error) {
-    console.error("[Omni Admin] Reset ledger error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
-  }
-});
+app.post("/api/v1/admin/reset-ledger", requireStrictAdminKey, safeRoute((_req, res) => {
+  resetLedger();
+  res.status(200).json({
+    success: true,
+    message: "Ledger reset: transactions, redemptions, ad events, and survey responses cleared; user balances zeroed.",
+  });
+}));
 
 app.get("/api/v1/admin/backup", requireAdminKey, async (_req: Request, res: Response) => {
   const tempPath = path.join(os.tmpdir(), `omni-backup-${Date.now()}.db`);
@@ -1060,8 +1182,11 @@ app.patch(
 app.post("/api/v1/admin/partners", requireAdminKey, (req: Request, res: Response) => {
   try {
     const name = typeof (req.body as { name?: unknown }).name === "string"
-      ? (req.body as { name: string }).name
+      ? (req.body as { name: string }).name.trim()
       : "";
+    if (name.length > 128) {
+      throw new ValidationError("name must be 128 characters or fewer.");
+    }
     const created = createPartner(name);
 
     res.status(201).json({
@@ -1085,12 +1210,12 @@ app.post("/api/v1/admin/partners", requireAdminKey, (req: Request, res: Response
   }
 });
 
-app.get("/api/v1/admin/partners", requireAdminKey, (_req: Request, res: Response) => {
+app.get("/api/v1/admin/partners", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
     success: true,
     data: getPartnerStats(),
   });
-});
+}));
 
 app.patch(
   "/api/v1/admin/partners/:id/active",
@@ -1893,4 +2018,12 @@ app.use(
 app.listen(PORT, "0.0.0.0", () => {
   console.info(`[Omni Backend] Server listening on http://localhost:${PORT}`);
   console.info(`[Omni Backend] Yield endpoint: POST http://localhost:${PORT}/api/v1/yield`);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[Omni Backend] uncaughtException (process kept alive):", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Omni Backend] unhandledRejection (process kept alive):", reason);
 });
