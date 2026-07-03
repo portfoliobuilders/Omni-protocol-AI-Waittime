@@ -1,12 +1,25 @@
 {
   "manifest_version": 3,
   "name": "OmniPiggy: Personal AI Dividend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Earn small rewards during AI wait time. Take a mindful break, answer a quick question, or claim a micro-dividend.",
   "homepage_url": "https://portfoliobuilders.in",
   "permissions": ["storage"],
   "host_permissions": [
-    "https://omni-protocol-ai-waittime-production.up.railway.app/*"
+    "https://omni-protocol-ai-waittime-production.up.railway.app/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://perplexity.ai/*",
+    "https://www.perplexity.ai/*",
+    "https://copilot.microsoft.com/*",
+    "https://chat.deepseek.com/*",
+    "https://grok.com/*",
+    "https://meta.ai/*",
+    "https://www.meta.ai/*",
+    "https://chat.mistral.ai/*",
+    "https://poe.com/*",
+    "https://www.poe.com/*"
   ],
   "icons": {
     "16": "icons/icon-16.png",
@@ -31,8 +44,19 @@
   "content_scripts": [
     {
       "matches": [
+        "https://chatgpt.com/*",
         "https://claude.ai/*",
-        "https://chatgpt.com/*"
+        "https://gemini.google.com/*",
+        "https://perplexity.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://copilot.microsoft.com/*",
+        "https://chat.deepseek.com/*",
+        "https://grok.com/*",
+        "https://meta.ai/*",
+        "https://www.meta.ai/*",
+        "https://chat.mistral.ai/*",
+        "https://poe.com/*",
+        "https://www.poe.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"

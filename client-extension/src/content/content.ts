@@ -3,12 +3,105 @@ const YIELD_LAYER = "behavioralLayer";
 const BOX_ID = "omni-piggy-mindful-break";
 const STYLE_ID = "omni-piggy-styles";
 
-const GENERATION_SELECTORS = [
+type SiteProfile = {
+  name: string;
+  hosts: string[];
+  selectors: string[];
+};
+
+const GENERIC_SELECTORS = [
   '[aria-label="Stop generating"]',
   '[aria-label*="Stop"]',
   '[data-testid="stop-button"]',
   'button[aria-label="Stop streaming"]',
-].join(", ");
+];
+
+const SITE_PROFILES: SiteProfile[] = [
+  {
+    name: "ChatGPT",
+    hosts: ["chatgpt.com"],
+    selectors: [
+      '[data-testid="stop-button"]',
+      '[aria-label="Stop generating"]',
+      'button[aria-label="Stop streaming"]',
+    ],
+  },
+  {
+    name: "Claude",
+    hosts: ["claude.ai"],
+    selectors: [
+      'button[aria-label="Stop streaming"]',
+      '[aria-label*="Stop"]',
+    ],
+  },
+  {
+    name: "Gemini",
+    hosts: ["gemini.google.com"],
+    selectors: [
+      'button[aria-label*="Stop"]',
+      'button[aria-label*="Cancel"]',
+      'button[title*="Stop"]',
+      'button[title*="Cancel"]',
+      '[role="progressbar"][aria-valuetext]',
+      '[role="progressbar"][aria-busy="true"]',
+    ],
+  },
+  {
+    name: "Perplexity",
+    hosts: ["perplexity.ai", "www.perplexity.ai"],
+    selectors: [
+      '[aria-label*="Stop"]',
+      '[data-testid*="stop"]',
+      '[data-testid*="typing"]',
+      '[data-testid*="cursor"]',
+    ],
+  },
+  {
+    name: "Copilot",
+    hosts: ["copilot.microsoft.com"],
+    selectors: [
+      '[aria-label*="Stop"]',
+      '[data-testid*="stop"]',
+      'button[type="submit"][disabled][aria-label*="Send"]',
+      'button[aria-label*="Send"][disabled]',
+    ],
+  },
+  {
+    name: "DeepSeek",
+    hosts: ["chat.deepseek.com"],
+    selectors: [
+      '[aria-label*="Stop"]',
+      '[data-testid*="stop"]',
+    ],
+  },
+  {
+    name: "Grok",
+    hosts: ["grok.com"],
+    selectors: [
+      '[aria-label*="Stop"]',
+      '[data-testid*="stop"]',
+    ],
+  },
+  {
+    name: "Meta AI",
+    hosts: ["meta.ai", "www.meta.ai"],
+    selectors: ['[aria-label*="Stop"]'],
+  },
+  {
+    name: "Le Chat",
+    hosts: ["chat.mistral.ai"],
+    selectors: ['[aria-label*="Stop"]'],
+  },
+  {
+    name: "Poe",
+    hosts: ["poe.com", "www.poe.com"],
+    selectors: [
+      '[aria-label*="Stop"]',
+      '[data-testid*="stop"]',
+      '[data-action*="stop"]',
+    ],
+  },
+];
 
 const ANCHOR_WALK_MAX = 12;
 const ANCHOR_MIN_WIDTH = 300;
@@ -19,6 +112,7 @@ let isGenerating = false;
 let boxMounted = false;
 let claimedThisCycle = false;
 let isClaiming = false;
+let detectionLoggedThisCycle = false;
 let currentSessionToken: string | null = null;
 let generationStartedAt: number | null = null;
 let waitTimerInterval: number | null = null;
@@ -656,9 +750,102 @@ function injectStyles(): void {
   document.head.appendChild(style);
 }
 
-function findGenerationIndicator(): HTMLElement | null {
-  return document.querySelector<HTMLElement>(GENERATION_SELECTORS);
+type GenerationMatch = {
+  element: HTMLElement;
+  profileName: string;
+  selector: string;
+};
+
+function hostMatchesProfile(hostname: string, hosts: string[]): boolean {
+  const normalized = hostname.toLowerCase();
+  return hosts.some((host) => {
+    const h = host.toLowerCase();
+    return normalized === h || normalized.endsWith(`.${h}`);
+  });
 }
+
+function getActiveSiteProfiles(): SiteProfile[] {
+  const hostname = window.location.hostname;
+  return SITE_PROFILES.filter((profile) => hostMatchesProfile(hostname, profile.hosts));
+}
+
+function getAllDetectionSelectors(): string[] {
+  const profileSelectors = getActiveSiteProfiles().flatMap((profile) => profile.selectors);
+  return [...profileSelectors, ...GENERIC_SELECTORS];
+}
+
+function findGenerationMatch(): GenerationMatch | null {
+  for (const profile of getActiveSiteProfiles()) {
+    for (const selector of profile.selectors) {
+      const element = document.querySelector<HTMLElement>(selector);
+      if (element) {
+        return { element, profileName: profile.name, selector };
+      }
+    }
+  }
+
+  for (const selector of GENERIC_SELECTORS) {
+    const element = document.querySelector<HTMLElement>(selector);
+    if (element) {
+      return { element, profileName: "generic", selector };
+    }
+  }
+
+  return null;
+}
+
+function findGenerationIndicator(): HTMLElement | null {
+  return findGenerationMatch()?.element ?? null;
+}
+
+function logDetectionMatch(match: GenerationMatch): void {
+  if (detectionLoggedThisCycle) return;
+  detectionLoggedThisCycle = true;
+  console.debug("[OmniPiggy] matched", match.profileName, match.selector);
+}
+
+function scopeHasStopControl(scope: ParentNode): boolean {
+  for (const selector of getAllDetectionSelectors()) {
+    if (scope.querySelector(selector)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function omniPiggyProbe(): void {
+  const hostname = window.location.hostname;
+  const activeProfiles = getActiveSiteProfiles();
+
+  console.log("[OmniPiggy] probe hostname:", hostname);
+  console.log(
+    "[OmniPiggy] active profiles:",
+    activeProfiles.length > 0 ? activeProfiles.map((p) => p.name).join(", ") : "(none)",
+  );
+
+  for (const profile of activeProfiles) {
+    for (const selector of profile.selectors) {
+      const count = document.querySelectorAll(selector).length;
+      console.log(
+        `[OmniPiggy] ${count > 0 ? "MATCH" : "miss"} profile=${profile.name} selector=${selector} count=${count}`,
+      );
+    }
+  }
+
+  for (const selector of GENERIC_SELECTORS) {
+    const count = document.querySelectorAll(selector).length;
+    console.log(
+      `[OmniPiggy] ${count > 0 ? "MATCH" : "miss"} profile=generic selector=${selector} count=${count}`,
+    );
+  }
+
+  const match = findGenerationMatch();
+  console.log("[OmniPiggy] findGenerationMatch:", match ?? "none");
+  console.log("[OmniPiggy] detectActiveWaitState:", detectActiveWaitState());
+  console.log("[OmniPiggy] inline anchor:", findInlineAnchor() ? "found" : "null (floating fallback)");
+}
+
+(window as Window & { __omniPiggyProbe?: () => void }).__omniPiggyProbe = omniPiggyProbe;
 
 function isElementVisible(el: HTMLElement): boolean {
   const rect = el.getBoundingClientRect();
@@ -673,9 +860,9 @@ function isElementVisible(el: HTMLElement): boolean {
 
 function isInConversationRegion(el: HTMLElement): boolean {
   return Boolean(
-    el.closest('main, [role="main"], article, form') ||
+    el.closest('main, [role="main"], article, form, [role="dialog"]') ||
       el.closest(
-        '[data-testid*="conversation"], [data-testid*="message"], [data-testid*="thread"], [data-testid*="composer"]',
+        '[data-testid*="conversation"], [data-testid*="message"], [data-testid*="thread"], [data-testid*="composer"], [data-testid*="chat"]',
       ),
   );
 }
@@ -699,30 +886,27 @@ function findInlineAnchor(): HTMLElement | null {
 }
 
 function detectActiveWaitState(): boolean {
-  if (document.querySelector(GENERATION_SELECTORS)) {
+  const match = findGenerationMatch();
+  if (match) {
+    logDetectionMatch(match);
     return true;
   }
 
-  const typingIndicators = document.querySelectorAll(
-    '[class*="typing"], [data-testid="conversation-turn"] [class*="result-streaming"]',
+  const progressBars = document.querySelectorAll(
+    '[role="progressbar"][aria-valuetext], [role="progressbar"][aria-busy="true"]',
   );
-  if (typingIndicators.length > 0) {
+  if (progressBars.length > 0) {
     return true;
   }
 
   const submitButtons = document.querySelectorAll<HTMLButtonElement>(
-    'button[type="submit"], button[data-testid="send-button"], form button[class*="send"]',
+    'button[type="submit"][disabled], button[data-testid="send-button"][disabled], button[data-testid*="send"][disabled], button[aria-label*="Send"][disabled]',
   );
 
   for (const button of submitButtons) {
-    if (!button.disabled) continue;
-
     const form = button.closest("form");
-    const hasStopControl = form
-      ? form.querySelector(GENERATION_SELECTORS)
-      : document.querySelector(GENERATION_SELECTORS);
-
-    if (hasStopControl) {
+    const scope = form ?? document;
+    if (scopeHasStopControl(scope)) {
       return true;
     }
   }
@@ -1008,6 +1192,7 @@ function evaluateWaitState(): void {
 
   if (active && !isGenerating) {
     claimedThisCycle = false;
+    detectionLoggedThisCycle = false;
     surveyFetchedThisCycle = false;
     surveyFetchInProgress = false;
     currentSurvey = null;
@@ -1059,7 +1244,16 @@ function startObserver(): void {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["aria-label", "disabled", "class", "data-testid"],
+    attributeFilter: [
+      "aria-label",
+      "aria-busy",
+      "aria-valuetext",
+      "disabled",
+      "data-testid",
+      "data-action",
+      "title",
+      "role",
+    ],
   });
 
   scheduleEvaluation();
