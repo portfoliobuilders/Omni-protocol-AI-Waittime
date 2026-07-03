@@ -325,3 +325,112 @@ export const recordSurveyResponse = db.transaction(
     }
   },
 );
+
+export interface SurveyAnswerBreakdown {
+  answer: string;
+  count: number;
+}
+
+export interface SurveyResult {
+  id: number;
+  question: string;
+  active: boolean;
+  totalResponses: number;
+  breakdown: SurveyAnswerBreakdown[];
+}
+
+export interface LedgerStats {
+  totalUsers: number;
+  totalTransactions: number;
+  totalPaidOut: number;
+  totalSurveyResponses: number;
+}
+
+export interface RecentTransaction {
+  id: number;
+  user_id: string;
+  amount: number;
+  layer: string;
+  created_at: string;
+}
+
+const selectAllSurveyQuestions = db.prepare(`
+  SELECT id, question, options, active
+  FROM survey_questions
+  ORDER BY id ASC
+`);
+
+const countSurveyResponsesByQuestion = db.prepare(`
+  SELECT answer, COUNT(*) AS count
+  FROM survey_responses
+  WHERE question_id = ?
+  GROUP BY answer
+`);
+
+const countUsers = db.prepare(`SELECT COUNT(*) AS count FROM users`);
+const countTransactions = db.prepare(
+  `SELECT COUNT(*) AS count FROM transactions`,
+);
+const sumTransactionAmounts = db.prepare(
+  `SELECT COALESCE(SUM(amount), 0) AS total FROM transactions`,
+);
+const countSurveyResponses = db.prepare(
+  `SELECT COUNT(*) AS count FROM survey_responses`,
+);
+
+const selectRecentTransactions = db.prepare(`
+  SELECT id, user_id, amount, layer, created_at
+  FROM transactions
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+
+export function getSurveyResults(): SurveyResult[] {
+  const questions = selectAllSurveyQuestions.all() as Array<
+    SurveyQuestionRow & { active: number }
+  >;
+
+  return questions.map((row) => {
+    const options = parseSurveyOptions(row.options);
+    const counts = countSurveyResponsesByQuestion.all(row.id) as Array<{
+      answer: string;
+      count: number;
+    }>;
+    const countByAnswer = new Map(
+      counts.map((entry) => [entry.answer, entry.count]),
+    );
+
+    const breakdown = options.map((answer) => ({
+      answer,
+      count: countByAnswer.get(answer) ?? 0,
+    }));
+
+    const totalResponses = breakdown.reduce((sum, entry) => sum + entry.count, 0);
+
+    return {
+      id: row.id,
+      question: row.question,
+      active: row.active === 1,
+      totalResponses,
+      breakdown,
+    };
+  });
+}
+
+export function getLedgerStats(): LedgerStats {
+  const users = countUsers.get() as { count: number };
+  const transactions = countTransactions.get() as { count: number };
+  const paidOut = sumTransactionAmounts.get() as { total: number };
+  const surveyResponses = countSurveyResponses.get() as { count: number };
+
+  return {
+    totalUsers: users.count,
+    totalTransactions: transactions.count,
+    totalPaidOut: paidOut.total,
+    totalSurveyResponses: surveyResponses.count,
+  };
+}
+
+export function getRecentTransactions(limit = 20): RecentTransaction[] {
+  return selectRecentTransactions.all(limit) as RecentTransaction[];
+}
