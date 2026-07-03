@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Omni B2B SDK Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: #0b0b0d;
+      color: #f4f4f5;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    main {
+      width: min(520px, 100%);
+      background: #141416;
+      border: 1px solid #27272a;
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.5rem;
+    }
+
+    p {
+      margin: 0 0 18px;
+      color: #a1a1aa;
+      line-height: 1.5;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      color: #d4d4d8;
+    }
+
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      margin-bottom: 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #3f3f46;
+      background: #0f0f11;
+      color: #f4f4f5;
+      font: inherit;
+    }
+
+    button {
+      width: 100%;
+      padding: 14px 16px;
+      border: none;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #39ff88 0%, #1a9f52 100%);
+      color: #0a1a10;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 16px;
+      min-height: 1.25rem;
+      font-size: 0.9rem;
+      color: #71717a;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Omni B2B SDK Demo</h1>
+    <p>
+      Paste your partner <code>pk_</code> key from the admin dashboard, then click
+      the fake-AI button. After 5 seconds the Omni card appears bottom-right —
+      claim ₹2 and verify the transaction under your partner in the dashboard.
+    </p>
+
+    <label for="partnerKey">Partner key</label>
+    <input
+      id="partnerKey"
+      type="text"
+      placeholder="pk_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      autocomplete="off"
+      spellcheck="false"
+    >
+
+    <button id="fakeAiBtn" type="button">Simulate AI generation (5s wait)</button>
+    <p class="status" id="status">Paste a partner key to begin.</p>
+  </main>
+
+  <!-- Production SDK (served by backend): -->
+  <script src="https://omni-protocol-ai-waittime-production.up.railway.app/sdk/omni.min.js"></script>
+  <!-- Local alternative: <script src="../dist/omni.min.js"></script> -->
+
+  <script>
+    const partnerKeyInput = document.getElementById("partnerKey");
+    const fakeAiBtn = document.getElementById("fakeAiBtn");
+    const statusEl = document.getElementById("status");
+    let fakeGenerationTimer = null;
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function ensureInitialized() {
+      const partnerKey = partnerKeyInput.value.trim();
+      if (!partnerKey) {
+        throw new Error("Paste your pk_ partner key first.");
+      }
+
+      Omni.init({
+        partnerKey: partnerKey,
+        apiBase: "https://omni-protocol-ai-waittime-production.up.railway.app",
+      });
+
+      return partnerKey;
+    }
+
+    fakeAiBtn.addEventListener("click", async function () {
+      fakeAiBtn.disabled = true;
+      setStatus("Starting simulated AI generation...");
+
+      try {
+        ensureInitialized();
+        await Omni.onGenerationStart();
+        setStatus("AI is thinking... Omni card will unlock the claim in 5s.");
+
+        if (fakeGenerationTimer) {
+          clearTimeout(fakeGenerationTimer);
+        }
+
+        fakeGenerationTimer = setTimeout(function () {
+          Omni.onGenerationEnd();
+          setStatus("Generation finished. Claim your dividend from the card.");
+          fakeAiBtn.disabled = false;
+        }, 8000);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Failed to start session.");
+        fakeAiBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
