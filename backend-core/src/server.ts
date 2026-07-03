@@ -19,6 +19,7 @@ dotenv.config();
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
 const PORT = Number(process.env.PORT ?? 3001);
+const ADMIN_KEY = process.env.OMNI_ADMIN_KEY;
 const VALID_LAYERS = new Set([
   "activeAiLayer",
   "behavioralLayer",
@@ -174,6 +175,27 @@ class ValidationError extends Error {
     super(message);
     this.name = "ValidationError";
   }
+}
+
+function requireAdminKey(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!ADMIN_KEY) {
+    next();
+    return;
+  }
+
+  if (req.query.key === ADMIN_KEY) {
+    next();
+    return;
+  }
+
+  res.status(401).json({
+    success: false,
+    message: "Unauthorized",
+  });
 }
 
 app.get("/health", (_req: Request, res: Response) => {
@@ -357,21 +379,21 @@ app.get("/api/v1/transactions/:userId", (req: Request, res: Response) => {
   });
 });
 
-app.get("/api/v1/admin/stats", (_req: Request, res: Response) => {
+app.get("/api/v1/admin/stats", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     data: getLedgerStats(),
   });
 });
 
-app.get("/api/v1/admin/surveys", (_req: Request, res: Response) => {
+app.get("/api/v1/admin/surveys", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     data: { results: getSurveyResults() },
   });
 });
 
-app.get("/api/v1/admin/transactions", (_req: Request, res: Response) => {
+app.get("/api/v1/admin/transactions", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     data: { transactions: getRecentTransactions(20) },
@@ -618,15 +640,19 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       }).join("");
       container.innerHTML = '<table><thead><tr><th>Time</th><th>User</th><th>Layer</th><th>Amount</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
+    function adminUrl(path) {
+      var key = new URLSearchParams(window.location.search).get("key");
+      return key ? path + "?key=" + encodeURIComponent(key) : path;
+    }
     async function loadDashboard() {
       var btn = document.getElementById("refreshBtn");
       btn.disabled = true;
       hideError();
       try {
         var responses = await Promise.all([
-          fetch("/api/v1/admin/stats"),
-          fetch("/api/v1/admin/surveys"),
-          fetch("/api/v1/admin/transactions"),
+          fetch(adminUrl("/api/v1/admin/stats")),
+          fetch(adminUrl("/api/v1/admin/surveys")),
+          fetch(adminUrl("/api/v1/admin/transactions")),
         ]);
         if (!responses[0].ok || !responses[1].ok || !responses[2].ok) {
           throw new Error("One or more API requests failed.");
@@ -652,7 +678,7 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-app.get("/admin", (_req: Request, res: Response) => {
+app.get("/admin", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).type("html").send(ADMIN_DASHBOARD_HTML);
 });
 
@@ -681,7 +707,7 @@ app.use(
   },
 );
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.info(`[Omni Backend] Server listening on http://localhost:${PORT}`);
   console.info(`[Omni Backend] Yield endpoint: POST http://localhost:${PORT}/api/v1/yield`);
 });

@@ -1,0 +1,3 @@
+# Keep the documented env template tracked even though the root
+# .gitignore ignores ".env.*" (real .env files stay ignored).
+!.env.example

@@ -1,5 +1,7 @@
-const API_BASE = "http://localhost:3001/api/v1";
-const HEALTH_URL = "http://localhost:3001/health";
+// Switch to http://localhost:3001 for local development.
+const API_BASE_URL = "https://omni-protocol-ai-waittime-production.up.railway.app";
+const API_BASE = `${API_BASE_URL}/api/v1`;
+const HEALTH_URL = `${API_BASE_URL}/health`;
 const REQUEST_TIMEOUT_MS = 5000;
 const EARNINGS_KEY = "omniEarnings";
 const USER_ID_KEY = "omniUserId";

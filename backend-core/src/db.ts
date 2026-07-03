@@ -1,8 +1,13 @@
 import Database from "better-sqlite3";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 
-const DB_PATH = path.join(process.cwd(), "omni-ledger.db");
+const DB_PATH = process.env.OMNI_DB_PATH
+  ? path.resolve(process.env.OMNI_DB_PATH)
+  : path.join(process.cwd(), "omni-ledger.db");
+
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
