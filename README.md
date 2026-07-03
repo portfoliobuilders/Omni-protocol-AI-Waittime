@@ -1,5 +1,7 @@
 # OmniPiggy
 
+[![CI](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml/badge.svg)](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml)
+
 OmniPiggy is a Chrome extension that detects AI generation wait time on claude.ai and chatgpt.com, shows a "Mindful Break" box, and lets the user claim micro-dividends that are credited to a persistent SQLite ledger via a local Node.js backend.
 
 ## Run the backend
