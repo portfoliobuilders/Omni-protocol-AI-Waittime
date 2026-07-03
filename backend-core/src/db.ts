@@ -56,6 +56,23 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, question_id)
   );
+
+  CREATE TABLE IF NOT EXISTS ads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    headline TEXT NOT NULL,
+    body TEXT NOT NULL,
+    cta_label TEXT NOT NULL,
+    cta_url TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+  );
+
+  CREATE TABLE IF NOT EXISTS ad_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ad_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('impression', 'click')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 const surveyQuestionCount = db
@@ -101,6 +118,22 @@ if (surveyQuestionCount.count === 0) {
   });
 
   seedSurveyQuestions();
+}
+
+const adCount = db
+  .prepare(`SELECT COUNT(*) AS count FROM ads`)
+  .get() as { count: number };
+
+if (adCount.count === 0) {
+  db.prepare(`
+    INSERT INTO ads (headline, body, cta_label, cta_url)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    "Portfolio Builders",
+    "FYUGP credit internships & tech courses in Kerala. Build your portfolio while you study.",
+    "Explore Internships",
+    "https://portfoliobuilders.in",
+  );
 }
 
 export interface TransactionRow {
@@ -446,4 +479,96 @@ export function getDbPath(): string {
 
 export function backupDatabase(destPath: string): Promise<Database.BackupMetadata> {
   return db.backup(destPath);
+}
+
+export interface Ad {
+  id: number;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+}
+
+export interface AdStat {
+  id: number;
+  headline: string;
+  impressions: number;
+  clicks: number;
+}
+
+interface AdRow {
+  id: number;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+}
+
+const selectRandomActiveAd = db.prepare(`
+  SELECT id, headline, body, cta_label, cta_url
+  FROM ads
+  WHERE active = 1
+  ORDER BY RANDOM()
+  LIMIT 1
+`);
+
+const selectAdById = db.prepare(`
+  SELECT id FROM ads WHERE id = ?
+`);
+
+const insertAdEvent = db.prepare(`
+  INSERT INTO ad_events (ad_id, user_id, event)
+  VALUES (?, ?, ?)
+`);
+
+const selectAdStats = db.prepare(`
+  SELECT
+    a.id,
+    a.headline,
+    COALESCE(SUM(CASE WHEN e.event = 'impression' THEN 1 ELSE 0 END), 0) AS impressions,
+    COALESCE(SUM(CASE WHEN e.event = 'click' THEN 1 ELSE 0 END), 0) AS clicks
+  FROM ads a
+  LEFT JOIN ad_events e ON e.ad_id = a.id
+  GROUP BY a.id, a.headline
+  ORDER BY a.id ASC
+`);
+
+export function getActiveAd(): Ad | null {
+  const row = selectRandomActiveAd.get() as AdRow | undefined;
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    headline: row.headline,
+    body: row.body,
+    cta_label: row.cta_label,
+    cta_url: row.cta_url,
+  };
+}
+
+export type RecordAdEventResult =
+  | { ok: true }
+  | { ok: false; reason: "invalid" };
+
+export function recordAdEvent(
+  adId: number,
+  userId: string,
+  event: string,
+): RecordAdEventResult {
+  if (event !== "impression" && event !== "click") {
+    return { ok: false, reason: "invalid" };
+  }
+
+  const ad = selectAdById.get(adId) as { id: number } | undefined;
+  if (!ad) {
+    return { ok: false, reason: "invalid" };
+  }
+
+  insertAdEvent.run(adId, userId, event);
+  return { ok: true };
+}
+
+export function getAdStats(): AdStat[] {
+  return selectAdStats.all() as AdStat[];
 }

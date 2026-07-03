@@ -397,6 +397,15 @@ export default function App() {
       <footer className="mt-6 border-t border-omni-border pt-3 text-center">
         <p className="text-[10px] font-mono tracking-wide text-zinc-600">
           ID: {userIdPrefix ?? "…"}
+          <span className="mx-1.5 text-zinc-700">·</span>
+          <a
+            href="https://omni-protocol-ai-waittime-production.up.railway.app/privacy"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-zinc-500 underline decoration-zinc-700 underline-offset-2 hover:text-zinc-400"
+          >
+            Privacy Policy
+          </a>
         </p>
       </footer>
     </div>

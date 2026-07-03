@@ -10,12 +10,15 @@ import {
   consumeClaimSession,
   createClaimSession,
   DuplicateTransactionError,
+  getActiveAd,
+  getAdStats,
   getBalance,
   getLedgerStats,
   getNextSurveyQuestion,
   getRecentTransactions,
   getSurveyResults,
   getTransactions,
+  recordAdEvent,
   recordSurveyResponse,
 } from "./db";
 
@@ -47,6 +50,12 @@ interface YieldRequestBody {
 
 interface SessionStartRequestBody {
   userId?: unknown;
+}
+
+interface AdEventRequestBody {
+  adId?: unknown;
+  userId?: unknown;
+  event?: unknown;
 }
 
 interface YieldTransaction {
@@ -208,6 +217,65 @@ app.get("/health", (_req: Request, res: Response) => {
     service: "omni-backend-core",
     timestamp: new Date().toISOString(),
   });
+});
+
+app.get("/privacy", (_req: Request, res: Response) => {
+  res.status(200).type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniPiggy Privacy Policy</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0f0f11;
+      color: #e4e4e7;
+      line-height: 1.6;
+      padding: 2rem 1.25rem 3rem;
+    }
+    main { max-width: 42rem; margin: 0 auto; }
+    h1 { font-size: 1.5rem; font-weight: 600; color: #fff; margin-bottom: 0.25rem; }
+    .effective { font-size: 0.875rem; color: #71717a; margin-bottom: 2rem; }
+    h2 { font-size: 1rem; font-weight: 600; color: #a1a1aa; margin: 1.5rem 0 0.5rem; }
+    p, li { font-size: 0.9375rem; color: #d4d4d8; margin-bottom: 0.75rem; }
+    ul { padding-left: 1.25rem; margin-bottom: 0.75rem; }
+    a { color: #22c55e; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>OmniPiggy Privacy Policy</h1>
+    <p class="effective">Effective date: July 3, 2026</p>
+    <p>OmniPiggy is a browser extension that rewards you during AI wait time. This policy explains what we collect and what we do not.</p>
+
+    <h2>What we collect</h2>
+    <ul>
+      <li>A random anonymous install ID generated on your device (stored locally and sent with API requests).</li>
+      <li>Claim transactions (amount, layer, timestamp, and a unique nonce to prevent duplicates).</li>
+      <li>Survey answers you choose to submit during wait-time prompts.</li>
+      <li>Ad impression and click counts when you interact with optional ads.</li>
+    </ul>
+
+    <h2>What we do not collect</h2>
+    <ul>
+      <li>Your name, email address, or other personal identity information.</li>
+      <li>Your browsing history outside supported AI chat pages.</li>
+      <li>Any content of your AI conversations. The extension only detects loading states on ChatGPT and Claude — it never reads your chats.</li>
+    </ul>
+
+    <h2>Where data lives</h2>
+    <p>Data is stored on our server (hosted on Railway). It is used to track your wallet balance, prevent duplicate claims, and improve the service.</p>
+
+    <h2>Your rights</h2>
+    <p>You may contact us to request deletion of your data. Uninstalling the extension stops all further collection from your browser.</p>
+
+    <h2>Contact</h2>
+    <p>Questions or deletion requests: <a href="mailto:contact@portfoliobuilders.in">contact@portfoliobuilders.in</a></p>
+  </main>
+</body>
+</html>`);
 });
 
 app.post("/api/v1/session/start", (req: Request, res: Response) => {
@@ -383,6 +451,65 @@ app.get("/api/v1/transactions/:userId", (req: Request, res: Response) => {
   });
 });
 
+app.get("/api/v1/ad/next", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    data: { ad: getActiveAd() },
+  });
+});
+
+app.post("/api/v1/ad/event", (req: Request, res: Response) => {
+  try {
+    const body = req.body as AdEventRequestBody;
+
+    const adId =
+      typeof body.adId === "number"
+        ? body.adId
+        : typeof body.adId === "string"
+          ? Number(body.adId)
+          : NaN;
+
+    if (!Number.isInteger(adId) || adId <= 0) {
+      throw new ValidationError("adId must be a positive integer.");
+    }
+
+    const userId = parseUserId(body.userId);
+
+    const event =
+      typeof body.event === "string" ? body.event.trim() : "";
+
+    if (event !== "impression" && event !== "click") {
+      throw new ValidationError("event must be 'impression' or 'click'.");
+    }
+
+    const result = recordAdEvent(adId, userId, event);
+
+    if (!result.ok) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid ad event.",
+      });
+      return;
+    }
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Ad] Unexpected error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
 app.get("/api/v1/admin/stats", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
@@ -401,6 +528,13 @@ app.get("/api/v1/admin/transactions", requireAdminKey, (_req: Request, res: Resp
   res.status(200).json({
     success: true,
     data: { transactions: getRecentTransactions(20) },
+  });
+});
+
+app.get("/api/v1/admin/ads", requireAdminKey, (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    data: getAdStats(),
   });
 });
 
@@ -606,6 +740,10 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     <div id="surveyResults"></div>
   </div>
   <div class="section">
+    <h2>Ad Performance</h2>
+    <div id="adStatsTable"></div>
+  </div>
+  <div class="section">
     <h2>Recent Transactions</h2>
     <div id="transactionsTable"></div>
   </div>
@@ -677,6 +815,25 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       }).join("");
       container.innerHTML = '<table><thead><tr><th>Time</th><th>User</th><th>Layer</th><th>Amount</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
+    function renderAdStats(ads) {
+      var container = document.getElementById("adStatsTable");
+      if (!ads.length) {
+        container.innerHTML = '<div class="empty">No ads yet.</div>';
+        return;
+      }
+      var rows = ads.map(function(ad) {
+        var ctr = ad.impressions > 0
+          ? ((ad.clicks / ad.impressions) * 100).toFixed(1) + "%"
+          : "0%";
+        return '<tr>' +
+          '<td>' + esc(ad.headline) + '</td>' +
+          '<td>' + ad.impressions + '</td>' +
+          '<td>' + ad.clicks + '</td>' +
+          '<td>' + ctr + '</td>' +
+          '</tr>';
+      }).join("");
+      container.innerHTML = '<table><thead><tr><th>Headline</th><th>Impressions</th><th>Clicks</th><th>CTR</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
     function adminUrl(path) {
       var key = new URLSearchParams(window.location.search).get("key");
       return key ? path + "?key=" + encodeURIComponent(key) : path;
@@ -690,18 +847,21 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
           fetch(adminUrl("/api/v1/admin/stats")),
           fetch(adminUrl("/api/v1/admin/surveys")),
           fetch(adminUrl("/api/v1/admin/transactions")),
+          fetch(adminUrl("/api/v1/admin/ads")),
         ]);
-        if (!responses[0].ok || !responses[1].ok || !responses[2].ok) {
+        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok) {
           throw new Error("One or more API requests failed.");
         }
         var statsJson = await responses[0].json();
         var surveysJson = await responses[1].json();
         var txJson = await responses[2].json();
-        if (!statsJson.success || !surveysJson.success || !txJson.success) {
+        var adsJson = await responses[3].json();
+        if (!statsJson.success || !surveysJson.success || !txJson.success || !adsJson.success) {
           throw new Error("API returned an error response.");
         }
         renderStats(statsJson.data);
         renderSurveys(surveysJson.data.results);
+        renderAdStats(adsJson.data);
         renderTransactions(txJson.data.transactions);
       } catch (err) {
         showError(err instanceof Error ? err.message : "Failed to load dashboard data.");
