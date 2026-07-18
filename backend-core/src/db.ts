@@ -74,6 +74,21 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_email TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    body TEXT NOT NULL,
+    cta_label TEXT NOT NULL,
+    cta_url TEXT NOT NULL,
+    cpm_paise INTEGER NOT NULL CHECK (cpm_paise > 0),
+    total_budget_paise INTEGER NOT NULL CHECK (total_budget_paise > 0),
+    spent_paise INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending_review'
+      CHECK (status IN ('pending_review', 'active', 'paused', 'exhausted')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS redemptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -100,6 +115,13 @@ const transactionColumns = db.pragma("table_info(transactions)") as Array<{
 }>;
 if (!transactionColumns.some((column) => column.name === "partner_id")) {
   db.exec(`ALTER TABLE transactions ADD COLUMN partner_id INTEGER`);
+}
+
+const adEventColumns = db.pragma("table_info(ad_events)") as Array<{
+  name: string;
+}>;
+if (!adEventColumns.some((column) => column.name === "campaign_id")) {
+  db.exec(`ALTER TABLE ad_events ADD COLUMN campaign_id INTEGER`);
 }
 
 const surveyQuestionCount = db
@@ -996,4 +1018,277 @@ export function getPartnerStats(): PartnerStat[] {
     transactions: row.transactions,
     totalPaid: row.totalPaid,
   }));
+}
+
+export type CampaignStatus =
+  | "pending_review"
+  | "active"
+  | "paused"
+  | "exhausted";
+
+export interface Campaign {
+  id: number;
+  advertiser_email: string;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+  cpm_paise: number;
+  total_budget_paise: number;
+  spent_paise: number;
+  status: CampaignStatus;
+  created_at: string;
+}
+
+export interface CampaignInput {
+  advertiser_email: string;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+  cpm_paise: number;
+  total_budget_paise: number;
+}
+
+export interface CampaignStat extends Campaign {
+  impressions: number;
+  clicks: number;
+}
+
+interface CampaignRow {
+  id: number;
+  advertiser_email: string;
+  headline: string;
+  body: string;
+  cta_label: string;
+  cta_url: string;
+  cpm_paise: number;
+  total_budget_paise: number;
+  spent_paise: number;
+  status: CampaignStatus;
+  created_at: string;
+}
+
+const insertCampaign = db.prepare(`
+  INSERT INTO campaigns (
+    advertiser_email, headline, body, cta_label, cta_url,
+    cpm_paise, total_budget_paise
+  )
+  VALUES (
+    @advertiser_email, @headline, @body, @cta_label, @cta_url,
+    @cpm_paise, @total_budget_paise
+  )
+`);
+
+const selectCampaignById = db.prepare(`
+  SELECT
+    id, advertiser_email, headline, body, cta_label, cta_url,
+    cpm_paise, total_budget_paise, spent_paise, status, created_at
+  FROM campaigns
+  WHERE id = ?
+`);
+
+const selectServableCampaign = db.prepare(`
+  SELECT
+    id, advertiser_email, headline, body, cta_label, cta_url,
+    cpm_paise, total_budget_paise, spent_paise, status, created_at
+  FROM campaigns
+  WHERE status = 'active' AND spent_paise < total_budget_paise
+  ORDER BY RANDOM()
+  LIMIT 1
+`);
+
+const updateCampaignStatus = db.prepare(`
+  UPDATE campaigns SET status = ? WHERE id = ?
+`);
+
+const insertCampaignAdEvent = db.prepare(`
+  INSERT INTO ad_events (ad_id, user_id, event, campaign_id)
+  VALUES (0, ?, ?, ?)
+`);
+
+const incrementCampaignSpend = db.prepare(`
+  UPDATE campaigns
+  SET
+    spent_paise = spent_paise + @cost,
+    status = CASE
+      WHEN spent_paise + @cost >= total_budget_paise THEN 'exhausted'
+      ELSE status
+    END
+  WHERE id = @id
+    AND status = 'active'
+    AND spent_paise < total_budget_paise
+`);
+
+const selectCampaignStats = db.prepare(`
+  SELECT
+    c.id, c.advertiser_email, c.headline, c.body, c.cta_label, c.cta_url,
+    c.cpm_paise, c.total_budget_paise, c.spent_paise, c.status, c.created_at,
+    COALESCE(SUM(CASE WHEN e.event = 'impression' THEN 1 ELSE 0 END), 0) AS impressions,
+    COALESCE(SUM(CASE WHEN e.event = 'click' THEN 1 ELSE 0 END), 0) AS clicks
+  FROM campaigns c
+  LEFT JOIN ad_events e ON e.campaign_id = c.id
+  WHERE (? IS NULL OR c.advertiser_email = ?)
+  GROUP BY
+    c.id, c.advertiser_email, c.headline, c.body, c.cta_label, c.cta_url,
+    c.cpm_paise, c.total_budget_paise, c.spent_paise, c.status, c.created_at
+  ORDER BY c.id DESC
+`);
+
+function mapCampaignRow(row: CampaignRow): Campaign {
+  return {
+    id: row.id,
+    advertiser_email: row.advertiser_email,
+    headline: row.headline,
+    body: row.body,
+    cta_label: row.cta_label,
+    cta_url: row.cta_url,
+    cpm_paise: row.cpm_paise,
+    total_budget_paise: row.total_budget_paise,
+    spent_paise: row.spent_paise,
+    status: row.status,
+    created_at: row.created_at,
+  };
+}
+
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+export function createCampaign(fields: CampaignInput): Campaign {
+  const advertiser_email = fields.advertiser_email.trim().toLowerCase();
+  const headline = fields.headline.trim();
+  const body = fields.body.trim();
+  const cta_label = fields.cta_label.trim();
+  const cta_url = fields.cta_url.trim();
+  const cpm_paise = fields.cpm_paise;
+  const total_budget_paise = fields.total_budget_paise;
+
+  if (!advertiser_email || !isValidEmail(advertiser_email)) {
+    throw new ContentValidationError("advertiser_email must be a valid email address.");
+  }
+  if (!headline) {
+    throw new ContentValidationError("headline must be a non-empty string.");
+  }
+  if (!body) {
+    throw new ContentValidationError("body must be a non-empty string.");
+  }
+  if (!cta_label) {
+    throw new ContentValidationError("cta_label must be a non-empty string.");
+  }
+  if (!cta_url.startsWith("https://")) {
+    throw new ContentValidationError("cta_url must start with https://.");
+  }
+  if (!Number.isInteger(cpm_paise) || cpm_paise <= 0) {
+    throw new ContentValidationError("cpm_paise must be a positive integer.");
+  }
+  if (!Number.isInteger(total_budget_paise) || total_budget_paise <= 0) {
+    throw new ContentValidationError("total_budget_paise must be a positive integer.");
+  }
+
+  const result = insertCampaign.run({
+    advertiser_email,
+    headline,
+    body,
+    cta_label,
+    cta_url,
+    cpm_paise,
+    total_budget_paise,
+  });
+
+  const row = selectCampaignById.get(Number(result.lastInsertRowid)) as CampaignRow;
+  return mapCampaignRow(row);
+}
+
+export type ReviewCampaignResult =
+  | { ok: true; status: CampaignStatus }
+  | { ok: false; reason: "not_found" | "not_pending" | "invalid_decision" };
+
+export function reviewCampaign(
+  id: number,
+  decision: "approve" | "reject",
+): ReviewCampaignResult {
+  if (decision !== "approve" && decision !== "reject") {
+    return { ok: false, reason: "invalid_decision" };
+  }
+
+  const row = selectCampaignById.get(id) as CampaignRow | undefined;
+  if (!row) {
+    return { ok: false, reason: "not_found" };
+  }
+  if (row.status !== "pending_review") {
+    return { ok: false, reason: "not_pending" };
+  }
+
+  const status: CampaignStatus = decision === "approve" ? "active" : "paused";
+  updateCampaignStatus.run(status, id);
+  return { ok: true, status };
+}
+
+export function getServableCampaign(): Campaign | null {
+  const row = selectServableCampaign.get() as CampaignRow | undefined;
+  return row ? mapCampaignRow(row) : null;
+}
+
+export type RecordCampaignImpressionResult =
+  | { ok: true; spent_paise: number; status: CampaignStatus }
+  | { ok: false; reason: "not_found" | "not_servable" };
+
+export const recordCampaignImpression = db.transaction(
+  (campaignId: number, userId: string): RecordCampaignImpressionResult => {
+    const row = selectCampaignById.get(campaignId) as CampaignRow | undefined;
+    if (!row) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (row.status !== "active" || row.spent_paise >= row.total_budget_paise) {
+      return { ok: false, reason: "not_servable" };
+    }
+
+    const cost = Math.floor(row.cpm_paise / 1000);
+    insertCampaignAdEvent.run(userId, "impression", campaignId);
+    const update = incrementCampaignSpend.run({ id: campaignId, cost });
+    if (update.changes === 0) {
+      return { ok: false, reason: "not_servable" };
+    }
+
+    const updated = selectCampaignById.get(campaignId) as CampaignRow;
+    return {
+      ok: true,
+      spent_paise: updated.spent_paise,
+      status: updated.status,
+    };
+  },
+);
+
+export type RecordCampaignClickResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" };
+
+export function recordCampaignClick(
+  campaignId: number,
+  userId: string,
+): RecordCampaignClickResult {
+  const row = selectCampaignById.get(campaignId) as CampaignRow | undefined;
+  if (!row) {
+    return { ok: false, reason: "not_found" };
+  }
+  insertCampaignAdEvent.run(userId, "click", campaignId);
+  return { ok: true };
+}
+
+export function getCampaignStats(advertiser_email?: string): CampaignStat[] {
+  const email = advertiser_email?.trim().toLowerCase() || null;
+  const rows = selectCampaignStats.all(email, email) as Array<
+    CampaignRow & { impressions: number; clicks: number }
+  >;
+
+  return rows.map((row) => ({
+    ...mapCampaignRow(row),
+    impressions: row.impressions,
+    clicks: row.clicks,
+  }));
+}
+
+export function getAllCampaignsAdmin(): CampaignStat[] {
+  return getCampaignStats();
 }

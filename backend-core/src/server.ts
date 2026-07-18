@@ -11,26 +11,33 @@ import {
   backupDatabase,
   consumeClaimSession,
   ContentValidationError,
+  createCampaign,
   createClaimSession,
   createPartner,
   DuplicateTransactionError,
   getActiveAd,
   getAdStats,
+  getAllCampaignsAdmin,
   getBalance,
+  getCampaignStats,
   getLedgerStats,
   getNextSurveyQuestion,
   getPartnerByKey,
   getPartnerStats,
   getRecentTransactions,
   getRedemptions,
+  getServableCampaign,
   getSurveyResults,
   getTransactions,
   getUserRedemptions,
   recordAdEvent,
+  recordCampaignClick,
+  recordCampaignImpression,
   recordSurveyResponse,
   requestRedemption,
   resetLedger,
   resolveRedemption,
+  reviewCampaign,
   setAdActive,
   setPartnerActive,
   setSurveyQuestionActive,
@@ -83,6 +90,21 @@ interface AdEventRequestBody {
   adId?: unknown;
   userId?: unknown;
   event?: unknown;
+  campaignId?: unknown;
+}
+
+interface CreateCampaignRequestBody {
+  advertiser_email?: unknown;
+  headline?: unknown;
+  body?: unknown;
+  cta_label?: unknown;
+  cta_url?: unknown;
+  cpm_paise?: unknown;
+  total_budget_paise?: unknown;
+}
+
+interface ReviewCampaignBody {
+  decision?: unknown;
 }
 
 interface RedeemRequestBody {
@@ -128,6 +150,7 @@ const RATE_LIMITED_POST_PATHS = new Set([
   "/api/v1/yield",
   "/api/v1/redeem",
   "/api/v1/ad/event",
+  "/api/v1/campaigns",
 ]);
 
 function postRateLimiter(req: Request, res: Response, next: NextFunction): void {
@@ -720,15 +743,80 @@ app.get("/api/v1/transactions/:userId", safeRoute((req, res) => {
 }));
 
 app.get("/api/v1/ad/next", safeRoute((_req, res) => {
+  const campaign = getServableCampaign();
+  if (campaign) {
+    res.status(200).json({
+      success: true,
+      data: {
+        ad: {
+          id: campaign.id,
+          headline: campaign.headline,
+          body: campaign.body,
+          cta_label: campaign.cta_label,
+          cta_url: campaign.cta_url,
+        },
+        source: "campaign",
+        campaignId: campaign.id,
+      },
+    });
+    return;
+  }
+
   res.status(200).json({
     success: true,
-    data: { ad: getActiveAd() },
+    data: {
+      ad: getActiveAd(),
+      source: "house",
+    },
   });
 }));
 
 app.post("/api/v1/ad/event", (req: Request, res: Response) => {
   try {
     const body = req.body as AdEventRequestBody;
+
+    const userId = parseUserId(body.userId);
+
+    const event =
+      typeof body.event === "string" ? body.event.trim() : "";
+
+    if (event !== "impression" && event !== "click") {
+      throw new ValidationError("event must be 'impression' or 'click'.");
+    }
+
+    const campaignIdRaw = body.campaignId;
+    const campaignId =
+      typeof campaignIdRaw === "number"
+        ? campaignIdRaw
+        : typeof campaignIdRaw === "string"
+          ? Number(campaignIdRaw)
+          : NaN;
+
+    if (Number.isInteger(campaignId) && campaignId > 0) {
+      if (event === "impression") {
+        const result = recordCampaignImpression(campaignId, userId);
+        if (!result.ok) {
+          res.status(400).json({
+            success: false,
+            message: "Invalid campaign impression.",
+          });
+          return;
+        }
+        res.status(200).json({ success: true });
+        return;
+      }
+
+      const clickResult = recordCampaignClick(campaignId, userId);
+      if (!clickResult.ok) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid campaign click.",
+        });
+        return;
+      }
+      res.status(200).json({ success: true });
+      return;
+    }
 
     const adId =
       typeof body.adId === "number"
@@ -739,15 +827,6 @@ app.post("/api/v1/ad/event", (req: Request, res: Response) => {
 
     if (!Number.isInteger(adId) || adId <= 0) {
       throw new ValidationError("adId must be a positive integer.");
-    }
-
-    const userId = parseUserId(body.userId);
-
-    const event =
-      typeof body.event === "string" ? body.event.trim() : "";
-
-    if (event !== "impression" && event !== "click") {
-      throw new ValidationError("event must be 'impression' or 'click'.");
     }
 
     const result = recordAdEvent(adId, userId, event);
@@ -777,6 +856,76 @@ app.post("/api/v1/ad/event", (req: Request, res: Response) => {
     });
   }
 });
+
+app.post("/api/v1/campaigns", (req: Request, res: Response) => {
+  try {
+    const body = req.body as CreateCampaignRequestBody;
+
+    const parsePositiveIntField = (value: unknown, field: string): number => {
+      const n =
+        typeof value === "number"
+          ? value
+          : typeof value === "string"
+            ? Number(value)
+            : NaN;
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new ValidationError(`${field} must be a positive integer.`);
+      }
+      return n;
+    };
+
+    const campaign = createCampaign({
+      advertiser_email:
+        typeof body.advertiser_email === "string" ? body.advertiser_email : "",
+      headline: typeof body.headline === "string" ? body.headline : "",
+      body: typeof body.body === "string" ? body.body : "",
+      cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
+      cta_url: typeof body.cta_url === "string" ? body.cta_url : "",
+      cpm_paise: parsePositiveIntField(body.cpm_paise, "cpm_paise"),
+      total_budget_paise: parsePositiveIntField(
+        body.total_budget_paise,
+        "total_budget_paise",
+      ),
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: campaign.id,
+        status: campaign.status,
+        note: "Campaign submitted for manual review. It will go live after an admin approves it.",
+      },
+    });
+  } catch (error) {
+    if (error instanceof ValidationError || error instanceof ContentValidationError) {
+      res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
+    console.error("[Omni Campaigns] Create error", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
+  }
+});
+
+app.get("/api/v1/campaigns/stats", safeRoute((req, res) => {
+  const email =
+    typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+
+  if (!email) {
+    throw new ValidationError("email query parameter is required.");
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { campaigns: getCampaignStats(email) },
+  });
+}));
 
 app.post("/api/v1/redeem", (req: Request, res: Response) => {
   try {
@@ -882,6 +1031,66 @@ app.get("/api/v1/admin/ads", requireAdminKey, safeRoute((_req, res) => {
     data: getAdStats(),
   });
 }));
+
+app.get("/api/v1/admin/campaigns", requireAdminKey, safeRoute((_req, res) => {
+  res.status(200).json({
+    success: true,
+    data: { campaigns: getAllCampaignsAdmin() },
+  });
+}));
+
+app.post(
+  "/api/v1/admin/campaigns/:id/review",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const decisionRaw = (req.body as ReviewCampaignBody).decision;
+      const decision =
+        typeof decisionRaw === "string" ? decisionRaw.trim() : "";
+
+      if (decision !== "approve" && decision !== "reject") {
+        throw new ValidationError("decision must be 'approve' or 'reject'.");
+      }
+
+      const result = reviewCampaign(id, decision);
+
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Campaign not found."
+            : result.reason === "not_pending"
+              ? "Campaign is not pending review."
+              : "Invalid review decision.";
+
+        res.status(result.reason === "not_found" ? 404 : 400).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: { id, status: result.status },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Review campaign error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
 
 app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
   const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
@@ -1484,6 +1693,25 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     .badge-pending { color: #fbbf24; }
     .badge-paid { color: #22c55e; }
     .badge-rejected { color: #fca5a5; }
+    .badge-active { color: #22c55e; }
+    .badge-paused { color: #a1a1aa; }
+    .badge-exhausted { color: #fca5a5; }
+    .badge-pending_review { color: #fbbf24; }
+    .spend-track {
+      width: 120px;
+      height: 8px;
+      background: #27272a;
+      border-radius: 4px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    .spend-fill {
+      height: 100%;
+      background: #22c55e;
+      border-radius: 4px;
+    }
     .history-table { margin-top: 16px; }
     .history-table h3 {
       font-size: 0.875rem;
@@ -1561,6 +1789,10 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       <button type="button" id="addAdBtn">Add Ad</button>
     </div>
     <div id="adStatsTable"></div>
+  </div>
+  <div class="section">
+    <h2>Campaigns</h2>
+    <div id="campaignsTable"></div>
   </div>
   <div class="section">
     <h2>Redemption Requests</h2>
@@ -1700,6 +1932,71 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
           toggleAdActive(Number(btn.getAttribute("data-ad-id")), btn.getAttribute("data-active") !== "true");
         });
       });
+    }
+    function fmtPaise(paise) {
+      return "₹" + (Number(paise) / 100).toFixed(2);
+    }
+    function campaignStatusBadge(status) {
+      return '<span class="badge-' + esc(status) + '">' + esc(status) + '</span>';
+    }
+    function renderCampaigns(campaigns) {
+      var container = document.getElementById("campaignsTable");
+      if (!campaigns.length) {
+        container.innerHTML = '<div class="empty">No campaigns yet.</div>';
+        return;
+      }
+      var rows = campaigns.map(function(c) {
+        var pct = c.total_budget_paise > 0
+          ? Math.min(100, (c.spent_paise / c.total_budget_paise) * 100)
+          : 0;
+        var actions = c.status === "pending_review"
+          ? '<button type="button" class="btn-sm" data-campaign-id="' + c.id + '" data-decision="approve">Approve</button>' +
+            '<button type="button" class="btn-sm btn-reject" data-campaign-id="' + c.id + '" data-decision="reject">Reject</button>'
+          : '—';
+        return '<tr data-id="' + c.id + '">' +
+          '<td>' + c.id + '</td>' +
+          '<td>' + esc(c.advertiser_email) + '</td>' +
+          '<td>' + esc(c.headline) + '</td>' +
+          '<td>' + campaignStatusBadge(c.status) + '</td>' +
+          '<td>' +
+          '<div class="spend-track"><div class="spend-fill" style="width:' + pct + '%"></div></div>' +
+          esc(fmtPaise(c.spent_paise)) + ' / ' + esc(fmtPaise(c.total_budget_paise)) +
+          '</td>' +
+          '<td>' + c.impressions + '</td>' +
+          '<td>' + c.clicks + '</td>' +
+          '<td>' + actions + '</td>' +
+          '</tr>';
+      }).join("");
+      container.innerHTML = '<table><thead><tr><th>ID</th><th>Advertiser</th><th>Headline</th><th>Status</th><th>Spend</th><th>Impr.</th><th>Clicks</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      container.querySelectorAll("[data-campaign-id]").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          reviewCampaign(Number(btn.getAttribute("data-campaign-id")), btn.getAttribute("data-decision"));
+        });
+      });
+    }
+    async function reviewCampaign(id, decision) {
+      hideError();
+      try {
+        var response = await fetch(adminUrl("/api/v1/admin/campaigns/" + id + "/review"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: decision }),
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to review campaign.");
+        }
+        await loadCampaigns();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Failed to review campaign.");
+      }
+    }
+    async function loadCampaigns() {
+      var response = await fetch(adminUrl("/api/v1/admin/campaigns"));
+      if (!response.ok) throw new Error("Failed to load campaigns.");
+      var json = await response.json();
+      if (!json.success) throw new Error("API returned an error response.");
+      renderCampaigns(json.data.campaigns);
     }
     function methodLabel(method) {
       return method === "amazon_voucher" ? "Amazon Pay voucher" : "UPI";
@@ -1949,8 +2246,9 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
           fetch(adminUrl("/api/v1/admin/transactions")),
           fetch(adminUrl("/api/v1/admin/ads")),
           fetch(adminUrl("/api/v1/admin/redemptions")),
+          fetch(adminUrl("/api/v1/admin/campaigns")),
         ]);
-        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok || !responses[5].ok) {
+        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok || !responses[5].ok || !responses[6].ok) {
           throw new Error("One or more API requests failed.");
         }
         var statsJson = await responses[0].json();
@@ -1959,13 +2257,15 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
         var txJson = await responses[3].json();
         var adsJson = await responses[4].json();
         var redemptionsJson = await responses[5].json();
-        if (!statsJson.success || !partnersJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success) {
+        var campaignsJson = await responses[6].json();
+        if (!statsJson.success || !partnersJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success || !campaignsJson.success) {
           throw new Error("API returned an error response.");
         }
         renderStats(statsJson.data);
         renderPartners(partnersJson.data);
         renderSurveys(surveysJson.data.results);
         renderAdStats(adsJson.data);
+        renderCampaigns(campaignsJson.data.campaigns);
         renderRedemptions(redemptionsJson.data.redemptions);
         renderTransactions(txJson.data.transactions);
       } catch (err) {
