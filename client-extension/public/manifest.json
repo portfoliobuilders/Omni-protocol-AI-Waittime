@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OmniPiggy: Personal AI Dividend",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Earn small rewards during AI wait time. Take a mindful break, answer a quick question, or claim a micro-dividend.",
   "homepage_url": "https://portfoliobuilders.in",
   "permissions": ["storage"],
