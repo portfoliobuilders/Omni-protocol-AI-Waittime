@@ -154,6 +154,12 @@ export const EARNER_SHARE = 60;
 export const POOL_SHARE = 20;
 export const PLATFORM_SHARE = 20;
 
+/**
+ * Minimum CPM in paise (₹10). Below this, floor(cpm/1000) is 0 and
+ * impressions would not spend budget or produce a revenue split.
+ */
+export const MIN_CPM_PAISE = 1000;
+
 /** Split integer paise so earner + pool + platform === gross (remainder → platform). */
 export function splitRevenuePaise(grossPaise: number): {
   earner_paise: number;
@@ -165,6 +171,14 @@ export function splitRevenuePaise(grossPaise: number): {
   const pool_paise = Math.floor((gross * POOL_SHARE) / 100);
   const platform_paise = gross - earner_paise - pool_paise;
   return { earner_paise, pool_paise, platform_paise };
+}
+
+/** Paise charged per impression from a CPM. Always ≥ 1 when cpm_paise > 0. */
+export function impressionCostPaise(cpmPaise: number): number {
+  if (!Number.isInteger(cpmPaise) || cpmPaise <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.floor(cpmPaise / 1000));
 }
 
 const transactionColumns = db.pragma("table_info(transactions)") as Array<{
@@ -1273,6 +1287,11 @@ export function createCampaign(fields: CampaignInput): Campaign {
   if (!Number.isInteger(cpm_paise) || cpm_paise <= 0) {
     throw new ContentValidationError("cpm_paise must be a positive integer.");
   }
+  if (cpm_paise < MIN_CPM_PAISE) {
+    throw new ContentValidationError(
+      `cpm_paise must be at least ${MIN_CPM_PAISE} (₹${MIN_CPM_PAISE / 100} CPM) so each impression spends at least 1 paise.`,
+    );
+  }
   if (!Number.isInteger(total_budget_paise) || total_budget_paise <= 0) {
     throw new ContentValidationError("total_budget_paise must be a positive integer.");
   }
@@ -1347,7 +1366,11 @@ export const recordCampaignImpression = db.transaction(
     }
 
     // Cost per impression in integer paise (micro-rupee unit for splits).
-    const cost = Math.floor(row.cpm_paise / 1000);
+    // max(1, …) guards legacy campaigns that slipped in below MIN_CPM_PAISE.
+    const cost = impressionCostPaise(row.cpm_paise);
+    if (cost <= 0) {
+      return { ok: false, reason: "not_servable" };
+    }
     const adEvent = insertCampaignAdEvent.run(userId, "impression", campaignId);
     const adEventId = Number(adEvent.lastInsertRowid);
 
