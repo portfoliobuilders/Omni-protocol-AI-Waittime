@@ -22,6 +22,7 @@ import {
   getCampaignStats,
   getLedgerStats,
   getNextSurveyQuestion,
+  getOrCreateAdvertiser,
   getPartnerByKey,
   getPartnerStats,
   getRecentTransactions,
@@ -30,10 +31,13 @@ import {
   getSurveyResults,
   getTransactions,
   getUserRedemptions,
+  listTopupRequests,
+  pauseAdvertiserCampaign,
   recordAdEvent,
   recordCampaignClick,
   recordCampaignImpression,
   recordSurveyResponse,
+  requestCampaignTopup,
   requestRedemption,
   resetLedger,
   resolveRedemption,
@@ -41,6 +45,7 @@ import {
   setAdActive,
   setPartnerActive,
   setSurveyQuestionActive,
+  verifyAdvertiser,
 } from "./db";
 
 dotenv.config();
@@ -135,7 +140,7 @@ app.use(
   cors({
     origin: true,
     methods: ["GET", "POST", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Adv-Email", "X-Adv-Key"],
   }),
 );
 
@@ -153,6 +158,13 @@ const RATE_LIMITED_POST_PATHS = new Set([
   "/api/v1/campaigns",
 ]);
 
+function isRateLimitedPostPath(pathname: string): boolean {
+  if (RATE_LIMITED_POST_PATHS.has(pathname)) {
+    return true;
+  }
+  return pathname.startsWith("/api/v1/advertiser/");
+}
+
 function postRateLimiter(req: Request, res: Response, next: NextFunction): void {
   if (req.method !== "POST") {
     next();
@@ -164,7 +176,7 @@ function postRateLimiter(req: Request, res: Response, next: NextFunction): void 
     return;
   }
 
-  if (!RATE_LIMITED_POST_PATHS.has(req.path)) {
+  if (!isRateLimitedPostPath(req.path)) {
     next();
     return;
   }
@@ -449,6 +461,34 @@ function requireStrictAdminKey(
     success: false,
     message: "Unauthorized",
   });
+}
+
+function readAdvertiserAuth(
+  req: Request,
+): { email: string; key: string } | null {
+  const emailRaw = req.headers["x-adv-email"];
+  const keyRaw = req.headers["x-adv-key"];
+  const email = typeof emailRaw === "string" ? emailRaw.trim().toLowerCase() : "";
+  const key = typeof keyRaw === "string" ? keyRaw.trim() : "";
+  if (!email || !key) {
+    return null;
+  }
+  return { email, key };
+}
+
+function requireAdvertiser(
+  req: Request,
+  res: Response,
+): { email: string } | null {
+  const creds = readAdvertiserAuth(req);
+  if (!creds || !verifyAdvertiser(creds.email, creds.key)) {
+    res.status(401).json({
+      success: false,
+      message: "Invalid advertiser credentials.",
+    });
+    return null;
+  }
+  return { email: creds.email };
 }
 
 app.get("/health", (_req: Request, res: Response) => {
@@ -1101,6 +1141,132 @@ app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
 
   res.status(200).json({
     success: true,
+    data: { campaigns: getAllCampaignsAdmin() },
+  });
+}));
+
+app.post(
+  "/api/v1/admin/campaigns/:id/review",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const decisionRaw = (req.body as ReviewCampaignBody).decision;
+      const decision =
+        typeof decisionRaw === "string" ? decisionRaw.trim() : "";
+
+      if (decision !== "approve" && decision !== "reject") {
+        throw new ValidationError("decision must be 'approve' or 'reject'.");
+      }
+
+      const result = reviewCampaign(id, decision);
+
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Campaign not found."
+            : result.reason === "not_pending"
+              ? "Campaign is not pending review."
+              : "Invalid review decision.";
+
+        res.status(result.reason === "not_found" ? 404 : 400).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: { id, status: result.status },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Review campaign error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.get("/api/v1/admin/topups", requireAdminKey, safeRoute((_req, res) => {
+  res.status(200).json({
+    success: true,
+    data: { topups: listTopupRequests() },
+  });
+}));
+
+app.post(
+  "/api/v1/admin/topups/:id/resolve",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const statusRaw = (req.body as ResolveTopupBody).status;
+      const status = typeof statusRaw === "string" ? statusRaw.trim() : "";
+
+      if (status !== "paid" && status !== "rejected") {
+        throw new ValidationError("status must be 'paid' or 'rejected'.");
+      }
+
+      const result = resolveTopupRequest(id, status);
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Top-up request not found."
+            : result.reason === "already_resolved"
+              ? "Top-up request has already been resolved."
+              : "Invalid top-up status.";
+        res.status(result.reason === "not_found" ? 404 : 400).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: {
+          topup: result.topup,
+          campaign: result.campaign,
+        },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Resolve top-up error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
+  const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
+  const status =
+    statusParam === "pending" || statusParam === "paid" || statusParam === "rejected"
+      ? statusParam
+      : undefined;
+
+  res.status(200).json({
+    success: true,
     data: { redemptions: getRedemptions(status) },
   });
 }));
@@ -1691,6 +1857,7 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     }
     .btn-reject:hover { background: #7f1d1d; }
     .badge-pending { color: #fbbf24; }
+    .badge-requested { color: #fbbf24; }
     .badge-paid { color: #22c55e; }
     .badge-rejected { color: #fca5a5; }
     .badge-active { color: #22c55e; }
@@ -2288,6 +2455,798 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
 
 app.get("/admin", requireAdminKey, (_req: Request, res: Response) => {
   res.status(200).type("html").send(ADMIN_DASHBOARD_HTML);
+});
+
+const ADVERTISE_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniPiggy — Advertise</title>
+  <style>
+    :root {
+      --bg: #0c0c0e;
+      --panel: #141416;
+      --border: #27272a;
+      --text: #e4e4e7;
+      --muted: #a1a1aa;
+      --green: #22c55e;
+      --green-dim: #16a34a;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(1200px 500px at 10% -10%, rgba(34,197,94,0.12), transparent 55%),
+        radial-gradient(900px 400px at 90% 0%, rgba(34,197,94,0.06), transparent 50%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 28px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #fafafa;
+    }
+    .brand span { color: var(--green); }
+    .nav a {
+      color: var(--muted);
+      text-decoration: none;
+      margin-left: 16px;
+      font-size: 0.9rem;
+    }
+    .nav a:hover { color: var(--green); }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1 {
+      font-size: 1.75rem;
+      margin-bottom: 8px;
+      color: #fafafa;
+    }
+    .lead {
+      color: var(--muted);
+      margin-bottom: 28px;
+      max-width: 52ch;
+      line-height: 1.5;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 24px;
+    }
+    @media (max-width: 840px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 22px;
+    }
+    label {
+      display: block;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field { margin-bottom: 14px; }
+    input, textarea, select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--text);
+      font: inherit;
+    }
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: var(--green);
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    button {
+      background: var(--green);
+      color: var(--bg);
+      border: none;
+      border-radius: 8px;
+      padding: 12px 18px;
+      font-weight: 700;
+      cursor: pointer;
+      width: 100%;
+    }
+    button:hover { background: var(--green-dim); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .preview-label {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 12px;
+    }
+    .ad-preview {
+      background: linear-gradient(160deg, #17171a, #101012);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .ad-preview h3 {
+      font-size: 1.05rem;
+      margin-bottom: 8px;
+      color: #fafafa;
+    }
+    .ad-preview p {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+      margin-bottom: 14px;
+      min-height: 2.8em;
+    }
+    .cta {
+      display: inline-block;
+      background: var(--green);
+      color: var(--bg);
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .error {
+      display: none;
+      background: #450a0a;
+      color: #fca5a5;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .success {
+      display: none;
+      background: #052e16;
+      border: 1px solid #166534;
+      border-radius: 12px;
+      padding: 18px;
+      margin-bottom: 20px;
+    }
+    .success h2 {
+      color: var(--green);
+      font-size: 1.1rem;
+      margin-bottom: 8px;
+    }
+    .key-box {
+      margin-top: 14px;
+      background: var(--bg);
+      border: 1px dashed var(--warn);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .key-box code {
+      display: block;
+      word-break: break-all;
+      color: var(--warn);
+      margin: 8px 0;
+      font-size: 0.9rem;
+    }
+    .copy-btn {
+      width: auto;
+      padding: 8px 12px;
+      font-size: 0.8rem;
+    }
+    .hint { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Omni<span>Piggy</span></div>
+    <nav class="nav">
+      <a href="/advertiser">Advertiser login</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Launch a campaign</h1>
+    <p class="lead">Build your OmniPiggy ad, preview it live, and submit for review. Approved campaigns serve during AI wait time.</p>
+    <div id="error" class="error"></div>
+    <div id="success" class="success"></div>
+    <div class="grid">
+      <form class="card" id="campaignForm">
+        <div class="field">
+          <label for="email">Advertiser email</label>
+          <input id="email" type="email" required placeholder="you@brand.com" autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="headline">Headline</label>
+          <input id="headline" type="text" required maxlength="80" placeholder="Short punchy headline">
+        </div>
+        <div class="field">
+          <label for="body">Body</label>
+          <textarea id="body" required maxlength="220" placeholder="One or two lines about your offer"></textarea>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="ctaLabel">CTA label</label>
+            <input id="ctaLabel" type="text" required maxlength="32" placeholder="Learn more">
+          </div>
+          <div class="field">
+            <label for="ctaUrl">CTA URL (https)</label>
+            <input id="ctaUrl" type="url" required placeholder="https://example.com">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="cpm">CPM (₹)</label>
+            <input id="cpm" type="number" min="1" step="1" value="50" required>
+          </div>
+          <div class="field">
+            <label for="budget">Budget (₹)</label>
+            <input id="budget" type="number" min="1" step="1" value="500" required>
+          </div>
+        </div>
+        <p class="hint">Budget and CPM are converted to paise on submit (₹1 = 100 paise).</p>
+        <button type="submit" id="submitBtn">Submit for review</button>
+      </form>
+      <aside class="card">
+        <div class="preview-label">Live preview</div>
+        <div class="ad-preview">
+          <h3 id="prevHeadline">Your headline</h3>
+          <p id="prevBody">Your supporting copy appears here.</p>
+          <a class="cta" id="prevCta" href="#" onclick="return false;">Learn more</a>
+        </div>
+      </aside>
+    </div>
+  </main>
+  <script>
+    function esc(text) {
+      var d = document.createElement("div");
+      d.textContent = text == null ? "" : String(text);
+      return d.innerHTML;
+    }
+    function rupeesToPaise(value) {
+      var n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) return NaN;
+      return Math.round(n * 100);
+    }
+    function syncPreview() {
+      document.getElementById("prevHeadline").textContent =
+        document.getElementById("headline").value.trim() || "Your headline";
+      document.getElementById("prevBody").textContent =
+        document.getElementById("body").value.trim() || "Your supporting copy appears here.";
+      document.getElementById("prevCta").textContent =
+        document.getElementById("ctaLabel").value.trim() || "Learn more";
+    }
+    ["headline", "body", "ctaLabel"].forEach(function(id) {
+      document.getElementById(id).addEventListener("input", syncPreview);
+    });
+    syncPreview();
+
+    document.getElementById("campaignForm").addEventListener("submit", async function(e) {
+      e.preventDefault();
+      var err = document.getElementById("error");
+      var success = document.getElementById("success");
+      var btn = document.getElementById("submitBtn");
+      err.style.display = "none";
+      success.style.display = "none";
+      btn.disabled = true;
+
+      var cpmPaise = rupeesToPaise(document.getElementById("cpm").value);
+      var budgetPaise = rupeesToPaise(document.getElementById("budget").value);
+      if (!Number.isInteger(cpmPaise) || !Number.isInteger(budgetPaise)) {
+        err.textContent = "CPM and budget must be positive amounts in rupees.";
+        err.style.display = "block";
+        btn.disabled = false;
+        return;
+      }
+
+      try {
+        var response = await fetch("/api/v1/campaigns", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            advertiser_email: document.getElementById("email").value.trim(),
+            headline: document.getElementById("headline").value.trim(),
+            body: document.getElementById("body").value.trim(),
+            cta_label: document.getElementById("ctaLabel").value.trim(),
+            cta_url: document.getElementById("ctaUrl").value.trim(),
+            cpm_paise: cpmPaise,
+            total_budget_paise: budgetPaise
+          })
+        });
+        var json = await response.json();
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Failed to create campaign.");
+        }
+
+        var html = "<h2>Campaign submitted</h2>" +
+          "<p>Campaign #" + esc(json.data.id) + " is <strong>" + esc(json.data.status) + "</strong>. " +
+          esc(json.data.note) + "</p>";
+
+        if (json.data.mgmt_key) {
+          html += '<div class="key-box">' +
+            "<strong>Save your management key</strong>" +
+            "<p class=\\"hint\\">You'll need this to log in at <a href=\\"/advertiser\\">/advertiser</a>. It is shown only once.</p>" +
+            "<code id=\\"mgmtKey\\">" + esc(json.data.mgmt_key) + "</code>" +
+            '<button type="button" class="copy-btn" id="copyKeyBtn">Copy key</button>' +
+            "</div>";
+          try {
+            sessionStorage.setItem("omni_adv_email", document.getElementById("email").value.trim().toLowerCase());
+            sessionStorage.setItem("omni_adv_key", json.data.mgmt_key);
+          } catch (storageErr) {}
+        }
+
+        success.innerHTML = html;
+        success.style.display = "block";
+        var copyBtn = document.getElementById("copyKeyBtn");
+        if (copyBtn) {
+          copyBtn.addEventListener("click", async function() {
+            var key = document.getElementById("mgmtKey").textContent;
+            try {
+              await navigator.clipboard.writeText(key);
+              copyBtn.textContent = "Copied";
+            } catch (copyErr) {
+              copyBtn.textContent = "Copy failed";
+            }
+          });
+        }
+        document.getElementById("campaignForm").reset();
+        syncPreview();
+      } catch (ex) {
+        err.textContent = ex instanceof Error ? ex.message : "Failed to create campaign.";
+        err.style.display = "block";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>`;
+
+const ADVERTISER_PORTAL_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniPiggy — Advertiser Portal</title>
+  <style>
+    :root {
+      --bg: #0c0c0e;
+      --panel: #141416;
+      --border: #27272a;
+      --text: #e4e4e7;
+      --muted: #a1a1aa;
+      --green: #22c55e;
+      --green-dim: #16a34a;
+      --warn: #fbbf24;
+      --danger: #fca5a5;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(1000px 420px at 0% -10%, rgba(34,197,94,0.1), transparent 55%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { font-size: 1.25rem; font-weight: 700; color: #fafafa; }
+    .brand span { color: var(--green); }
+    .nav a, .nav button.link {
+      color: var(--muted);
+      text-decoration: none;
+      margin-left: 14px;
+      font-size: 0.9rem;
+      background: none;
+      border: none;
+      cursor: pointer;
+      font: inherit;
+    }
+    .nav a:hover, .nav button.link:hover { color: var(--green); }
+    main { max-width: 960px; margin: 0 auto; padding: 28px 18px 64px; }
+    h1 { font-size: 1.55rem; margin-bottom: 8px; color: #fafafa; }
+    .lead { color: var(--muted); margin-bottom: 22px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field { margin-bottom: 12px; }
+    input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--text);
+      font: inherit;
+    }
+    input:focus { outline: none; border-color: var(--green); }
+    button {
+      background: var(--green);
+      color: var(--bg);
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: var(--green-dim); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.danger {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid #7f1d1d;
+    }
+    .error {
+      display: none;
+      background: #450a0a;
+      color: var(--danger);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .login-wrap { max-width: 420px; margin: 40px auto; }
+    .campaign-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }
+    .campaign-head h2 { font-size: 1.05rem; color: #fafafa; }
+    .badge {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .badge.active { color: var(--green); border-color: #166534; }
+    .badge.paused { color: var(--muted); }
+    .badge.pending_review { color: var(--warn); border-color: #854d0e; }
+    .badge.exhausted { color: var(--danger); border-color: #7f1d1d; }
+    .spend-label { font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+    .spend-track {
+      height: 8px;
+      background: #27272a;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .spend-fill { height: 100%; background: var(--green); }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 14px;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .topup-form {
+      display: none;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+    .topup-form.open { display: block; }
+    .topup-row { display: flex; gap: 8px; align-items: end; }
+    .topup-row .field { flex: 1; margin-bottom: 0; }
+    .note {
+      margin-top: 10px;
+      color: var(--warn);
+      font-size: 0.85rem;
+      display: none;
+    }
+    .empty { color: var(--muted); font-style: italic; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Omni<span>Piggy</span></div>
+    <nav class="nav">
+      <a href="/advertise">New campaign</a>
+      <button type="button" class="link hidden" id="logoutBtn">Log out</button>
+    </nav>
+  </header>
+  <main>
+    <div id="error" class="error"></div>
+    <section id="loginView" class="login-wrap">
+      <h1>Advertiser portal</h1>
+      <p class="lead">Sign in with your email and management key to manage campaigns.</p>
+      <form class="card" id="loginForm">
+        <div class="field">
+          <label for="loginEmail">Email</label>
+          <input id="loginEmail" type="email" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="loginKey">Management key</label>
+          <input id="loginKey" type="password" required autocomplete="current-password" placeholder="adv_…">
+        </div>
+        <button type="submit" id="loginBtn">Sign in</button>
+      </form>
+    </section>
+    <section id="dashView" class="hidden">
+      <h1>Your campaigns</h1>
+      <p class="lead" id="dashEmail"></p>
+      <div id="campaignList"></div>
+    </section>
+  </main>
+  <script>
+    var STORAGE_EMAIL = "omni_adv_email";
+    var STORAGE_KEY = "omni_adv_key";
+
+    function esc(text) {
+      var d = document.createElement("div");
+      d.textContent = text == null ? "" : String(text);
+      return d.innerHTML;
+    }
+    function showError(msg) {
+      var el = document.getElementById("error");
+      el.textContent = msg;
+      el.style.display = "block";
+    }
+    function hideError() {
+      document.getElementById("error").style.display = "none";
+    }
+    function getCreds() {
+      try {
+        var email = sessionStorage.getItem(STORAGE_EMAIL) || "";
+        var key = sessionStorage.getItem(STORAGE_KEY) || "";
+        if (!email || !key) return null;
+        return { email: email, key: key };
+      } catch (e) {
+        return null;
+      }
+    }
+    function setCreds(email, key) {
+      sessionStorage.setItem(STORAGE_EMAIL, email);
+      sessionStorage.setItem(STORAGE_KEY, key);
+    }
+    function clearCreds() {
+      sessionStorage.removeItem(STORAGE_EMAIL);
+      sessionStorage.removeItem(STORAGE_KEY);
+    }
+    function authHeaders() {
+      var c = getCreds();
+      return {
+        "Content-Type": "application/json",
+        "X-Adv-Email": c.email,
+        "X-Adv-Key": c.key
+      };
+    }
+    function fmtPaise(paise) {
+      return "₹" + (Number(paise) / 100).toFixed(2);
+    }
+    function ctr(impr, clicks) {
+      if (!impr) return "0%";
+      return ((clicks / impr) * 100).toFixed(1) + "%";
+    }
+    function showLogin() {
+      document.getElementById("loginView").classList.remove("hidden");
+      document.getElementById("dashView").classList.add("hidden");
+      document.getElementById("logoutBtn").classList.add("hidden");
+    }
+    function showDash() {
+      document.getElementById("loginView").classList.add("hidden");
+      document.getElementById("dashView").classList.remove("hidden");
+      document.getElementById("logoutBtn").classList.remove("hidden");
+    }
+
+    async function loadCampaigns() {
+      hideError();
+      var creds = getCreds();
+      if (!creds) {
+        showLogin();
+        return;
+      }
+      var response = await fetch("/api/v1/advertiser/campaigns", {
+        headers: authHeaders()
+      });
+      var json = await response.json().catch(function() { return {}; });
+      if (response.status === 401) {
+        clearCreds();
+        showLogin();
+        showError("Invalid email or management key.");
+        return;
+      }
+      if (!response.ok || !json.success) {
+        throw new Error(json.message || "Failed to load campaigns.");
+      }
+      showDash();
+      document.getElementById("dashEmail").textContent = "Signed in as " + creds.email;
+      renderCampaigns(json.data.campaigns || []);
+    }
+
+    function renderCampaigns(campaigns) {
+      var container = document.getElementById("campaignList");
+      if (!campaigns.length) {
+        container.innerHTML = '<div class="card empty">No campaigns yet. <a href="/advertise">Create one</a>.</div>';
+        return;
+      }
+      container.innerHTML = campaigns.map(function(c) {
+        var pct = c.total_budget_paise > 0
+          ? Math.min(100, (c.spent_paise / c.total_budget_paise) * 100)
+          : 0;
+        var pauseResume = "";
+        if (c.status === "active") {
+          pauseResume = '<button type="button" class="secondary" data-action="pause" data-id="' + c.id + '">Pause</button>';
+        } else if (c.status === "paused") {
+          pauseResume = '<button type="button" class="secondary" data-action="resume" data-id="' + c.id + '">Resume</button>';
+        }
+        return '<article class="card" data-campaign="' + c.id + '">' +
+          '<div class="campaign-head">' +
+          "<h2>" + esc(c.headline) + "</h2>" +
+          '<span class="badge ' + esc(c.status) + '">' + esc(c.status) + "</span>" +
+          "</div>" +
+          '<div class="spend-label">' + esc(fmtPaise(c.spent_paise)) + " of " + esc(fmtPaise(c.total_budget_paise)) + " spent</div>" +
+          '<div class="spend-track"><div class="spend-fill" style="width:' + pct + '%"></div></div>' +
+          '<div class="meta">' +
+          "<span>" + c.impressions + " impressions</span>" +
+          "<span>" + c.clicks + " clicks</span>" +
+          "<span>CTR " + esc(ctr(c.impressions, c.clicks)) + "</span>" +
+          "</div>" +
+          '<div class="actions">' +
+          pauseResume +
+          '<button type="button" data-action="topup-toggle" data-id="' + c.id + '">Top up</button>' +
+          "</div>" +
+          '<div class="topup-form" id="topup-' + c.id + '">' +
+          '<div class="topup-row">' +
+          '<div class="field"><label>Amount (₹)</label><input type="number" min="1" step="1" id="topup-amount-' + c.id + '" value="500"></div>' +
+          '<button type="button" data-action="topup-submit" data-id="' + c.id + '">Request top-up</button>' +
+          "</div>" +
+          '<div class="note" id="topup-note-' + c.id + '">Requested — we\\'ll email a UPI payment link; budget updates once paid.</div>' +
+          "</div>" +
+          "</article>";
+      }).join("");
+
+      container.querySelectorAll("[data-action]").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          var id = Number(btn.getAttribute("data-id"));
+          var action = btn.getAttribute("data-action");
+          if (action === "pause") return pauseResume(id, "pause");
+          if (action === "resume") return pauseResume(id, "resume");
+          if (action === "topup-toggle") {
+            document.getElementById("topup-" + id).classList.toggle("open");
+            return;
+          }
+          if (action === "topup-submit") return submitTopup(id);
+        });
+      });
+    }
+
+    async function pauseResume(id, action) {
+      hideError();
+      try {
+        var response = await fetch("/api/v1/advertiser/campaigns/" + id + "/" + action, {
+          method: "POST",
+          headers: authHeaders()
+        });
+        var json = await response.json().catch(function() { return {}; });
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Action failed.");
+        }
+        await loadCampaigns();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Action failed.");
+      }
+    }
+
+    async function submitTopup(id) {
+      hideError();
+      var rupees = Number(document.getElementById("topup-amount-" + id).value);
+      var amount_paise = Math.round(rupees * 100);
+      if (!Number.isInteger(amount_paise) || amount_paise <= 0) {
+        showError("Enter a positive top-up amount in rupees.");
+        return;
+      }
+      try {
+        var response = await fetch("/api/v1/advertiser/campaigns/" + id + "/topup", {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ amount_paise: amount_paise })
+        });
+        var json = await response.json().catch(function() { return {}; });
+        if (!response.ok || !json.success) {
+          throw new Error(json.message || "Top-up request failed.");
+        }
+        var note = document.getElementById("topup-note-" + id);
+        note.style.display = "block";
+      } catch (err) {
+        showError(err instanceof Error ? err.message : "Top-up request failed.");
+      }
+    }
+
+    document.getElementById("loginForm").addEventListener("submit", async function(e) {
+      e.preventDefault();
+      hideError();
+      var email = document.getElementById("loginEmail").value.trim().toLowerCase();
+      var key = document.getElementById("loginKey").value.trim();
+      setCreds(email, key);
+      var btn = document.getElementById("loginBtn");
+      btn.disabled = true;
+      try {
+        await loadCampaigns();
+      } catch (err) {
+        clearCreds();
+        showLogin();
+        showError(err instanceof Error ? err.message : "Sign-in failed.");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("logoutBtn").addEventListener("click", function() {
+      clearCreds();
+      hideError();
+      showLogin();
+    });
+
+    (async function init() {
+      var creds = getCreds();
+      if (!creds) {
+        showLogin();
+        return;
+      }
+      document.getElementById("loginEmail").value = creds.email;
+      try {
+        await loadCampaigns();
+      } catch (err) {
+        showLogin();
+        showError(err instanceof Error ? err.message : "Failed to restore session.");
+      }
+    })();
+  </script>
+</body>
+</html>`;
+
+app.get("/advertise", (_req: Request, res: Response) => {
+  res.status(200).type("html").send(ADVERTISE_PAGE_HTML);
+});
+
+app.get("/advertiser", (_req: Request, res: Response) => {
+  res.status(200).type("html").send(ADVERTISER_PORTAL_HTML);
 });
 
 app.use((_req: Request, res: Response) => {

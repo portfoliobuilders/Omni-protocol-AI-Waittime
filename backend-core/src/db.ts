@@ -108,6 +108,24 @@ db.exec(`
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS advertisers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    mgmt_key TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS topup_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+    status TEXT NOT NULL DEFAULT 'requested'
+      CHECK (status IN ('requested', 'paid', 'rejected')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+  );
 `);
 
 const transactionColumns = db.pragma("table_info(transactions)") as Array<{
