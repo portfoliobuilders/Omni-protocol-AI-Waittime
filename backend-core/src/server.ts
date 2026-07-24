@@ -41,6 +41,8 @@ import {
   requestRedemption,
   resetLedger,
   resolveRedemption,
+  resolveTopupRequest,
+  resumeAdvertiserCampaign,
   reviewCampaign,
   setAdActive,
   setPartnerActive,
@@ -110,6 +112,14 @@ interface CreateCampaignRequestBody {
 
 interface ReviewCampaignBody {
   decision?: unknown;
+}
+
+interface TopupRequestBody {
+  amount_paise?: unknown;
+}
+
+interface ResolveTopupBody {
+  status?: unknown;
 }
 
 interface RedeemRequestBody {
@@ -914,9 +924,12 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
       return n;
     };
 
+    const advertiserEmail =
+      typeof body.advertiser_email === "string" ? body.advertiser_email : "";
+    const advertiser = getOrCreateAdvertiser(advertiserEmail);
+
     const campaign = createCampaign({
-      advertiser_email:
-        typeof body.advertiser_email === "string" ? body.advertiser_email : "",
+      advertiser_email: advertiser.email,
       headline: typeof body.headline === "string" ? body.headline : "",
       body: typeof body.body === "string" ? body.body : "",
       cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
@@ -928,13 +941,21 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
       ),
     });
 
+    const data: Record<string, unknown> = {
+      id: campaign.id,
+      status: campaign.status,
+      note: "Campaign submitted for manual review. It will go live after an admin approves it.",
+    };
+
+    if (advertiser.isNew) {
+      data.mgmt_key = advertiser.mgmt_key;
+      data.mgmt_key_note =
+        "Save this management key now — it is shown only once. You will need it to log in at /advertiser.";
+    }
+
     res.status(201).json({
       success: true,
-      data: {
-        id: campaign.id,
-        status: campaign.status,
-        note: "Campaign submitted for manual review. It will go live after an admin approves it.",
-      },
+      data,
     });
   } catch (error) {
     if (error instanceof ValidationError || error instanceof ContentValidationError) {
@@ -954,18 +975,182 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
 });
 
 app.get("/api/v1/campaigns/stats", safeRoute((req, res) => {
-  const email =
-    typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
-
-  if (!email) {
-    throw new ValidationError("email query parameter is required.");
+  const auth = requireAdvertiser(req, res);
+  if (!auth) {
+    return;
   }
 
   res.status(200).json({
     success: true,
-    data: { campaigns: getCampaignStats(email) },
+    data: { campaigns: getCampaignStats(auth.email) },
   });
 }));
+
+app.get("/api/v1/advertiser/campaigns", safeRoute((req, res) => {
+  const auth = requireAdvertiser(req, res);
+  if (!auth) {
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { campaigns: getCampaignStats(auth.email) },
+  });
+}));
+
+app.post(
+  "/api/v1/advertiser/campaigns/:id/pause",
+  (req: Request, res: Response) => {
+    try {
+      const auth = requireAdvertiser(req, res);
+      if (!auth) {
+        return;
+      }
+
+      const id = parsePositiveInt(req.params.id, "id");
+      const result = pauseAdvertiserCampaign(auth.email, id);
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Campaign not found."
+            : result.reason === "not_owner"
+              ? "Campaign not found."
+              : "Campaign can only be paused when active.";
+        res.status(result.reason === "invalid_transition" ? 400 : 404).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: { id, status: result.status },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Advertiser] Pause campaign error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/v1/advertiser/campaigns/:id/resume",
+  (req: Request, res: Response) => {
+    try {
+      const auth = requireAdvertiser(req, res);
+      if (!auth) {
+        return;
+      }
+
+      const id = parsePositiveInt(req.params.id, "id");
+      const result = resumeAdvertiserCampaign(auth.email, id);
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Campaign not found."
+            : result.reason === "not_owner"
+              ? "Campaign not found."
+              : "Campaign can only be resumed when paused.";
+        res.status(result.reason === "invalid_transition" ? 400 : 404).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: { id, status: result.status },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Advertiser] Resume campaign error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/v1/advertiser/campaigns/:id/topup",
+  (req: Request, res: Response) => {
+    try {
+      const auth = requireAdvertiser(req, res);
+      if (!auth) {
+        return;
+      }
+
+      const id = parsePositiveInt(req.params.id, "id");
+      const amountRaw = (req.body as TopupRequestBody).amount_paise;
+      const amount_paise =
+        typeof amountRaw === "number"
+          ? amountRaw
+          : typeof amountRaw === "string"
+            ? Number(amountRaw)
+            : NaN;
+
+      if (!Number.isInteger(amount_paise) || amount_paise <= 0) {
+        throw new ValidationError("amount_paise must be a positive integer.");
+      }
+
+      const result = requestCampaignTopup(auth.email, id, amount_paise);
+      if (!result.ok) {
+        const message =
+          result.reason === "invalid_amount"
+            ? "amount_paise must be a positive integer."
+            : "Campaign not found.";
+        res.status(result.reason === "invalid_amount" ? 400 : 404).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(201).json({
+        success: true,
+        data: {
+          topup: result.topup,
+          note: "Requested — we'll email a UPI payment link; budget updates once paid.",
+        },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Advertiser] Top-up request error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
 
 app.post("/api/v1/redeem", (req: Request, res: Response) => {
   try {
@@ -1073,72 +1258,6 @@ app.get("/api/v1/admin/ads", requireAdminKey, safeRoute((_req, res) => {
 }));
 
 app.get("/api/v1/admin/campaigns", requireAdminKey, safeRoute((_req, res) => {
-  res.status(200).json({
-    success: true,
-    data: { campaigns: getAllCampaignsAdmin() },
-  });
-}));
-
-app.post(
-  "/api/v1/admin/campaigns/:id/review",
-  requireAdminKey,
-  (req: Request, res: Response) => {
-    try {
-      const id = parsePositiveInt(req.params.id, "id");
-      const decisionRaw = (req.body as ReviewCampaignBody).decision;
-      const decision =
-        typeof decisionRaw === "string" ? decisionRaw.trim() : "";
-
-      if (decision !== "approve" && decision !== "reject") {
-        throw new ValidationError("decision must be 'approve' or 'reject'.");
-      }
-
-      const result = reviewCampaign(id, decision);
-
-      if (!result.ok) {
-        const message =
-          result.reason === "not_found"
-            ? "Campaign not found."
-            : result.reason === "not_pending"
-              ? "Campaign is not pending review."
-              : "Invalid review decision.";
-
-        res.status(result.reason === "not_found" ? 404 : 400).json({
-          success: false,
-          message,
-        });
-        return;
-      }
-
-      res.status(200).json({
-        success: true,
-        data: { id, status: result.status },
-      });
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-        });
-        return;
-      }
-
-      console.error("[Omni Admin] Review campaign error", error);
-      res.status(500).json({
-        success: false,
-        message: "Internal server error.",
-      });
-    }
-  },
-);
-
-app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
-  const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
-  const status =
-    statusParam === "pending" || statusParam === "paid" || statusParam === "rejected"
-      ? statusParam
-      : undefined;
-
   res.status(200).json({
     success: true,
     data: { campaigns: getAllCampaignsAdmin() },
