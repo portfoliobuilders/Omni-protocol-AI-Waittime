@@ -158,6 +158,7 @@ type SponsoredAd = {
   body: string;
   cta_label: string;
   cta_url: string;
+  campaignId?: number;
 };
 
 type BackgroundMessage =
@@ -167,7 +168,11 @@ type BackgroundMessage =
   | { type: "GET_AD"; payload?: undefined }
   | {
       type: "AD_EVENT";
-      payload: { adId: number; event: "impression" | "click" };
+      payload: {
+        adId: number;
+        event: "impression" | "click";
+        campaignId?: number;
+      };
     }
   | {
       type: "CLAIM_YIELD";
@@ -357,11 +362,21 @@ async function fetchAdForTier2(): Promise<void> {
     if (response.ok) {
       const payload = response.data as {
         success?: boolean;
-        data?: { ad?: SponsoredAd | null };
+        data?: {
+          ad?: SponsoredAd | null;
+          source?: string;
+          campaignId?: number;
+        };
       };
       const ad = payload.success && payload.data?.ad ? payload.data.ad : null;
       if (ad && ad.headline && ad.cta_url) {
-        currentAd = ad;
+        const campaignId =
+          payload.data?.source === "campaign" &&
+          typeof payload.data.campaignId === "number" &&
+          payload.data.campaignId > 0
+            ? payload.data.campaignId
+            : undefined;
+        currentAd = campaignId ? { ...ad, campaignId } : ad;
       } else {
         currentAd = null;
       }
@@ -417,7 +432,13 @@ function renderAdCard(box: HTMLElement): void {
   cta.addEventListener("click", () => {
     void sendBackgroundMessage({
       type: "AD_EVENT",
-      payload: { adId: adSnapshot.id, event: "click" },
+      payload: {
+        adId: adSnapshot.id,
+        event: "click",
+        ...(adSnapshot.campaignId
+          ? { campaignId: adSnapshot.campaignId }
+          : {}),
+      },
     });
     window.open(adSnapshot.cta_url, "_blank", "noopener");
   });
@@ -428,7 +449,11 @@ function renderAdCard(box: HTMLElement): void {
     adImpressionSent = true;
     void sendBackgroundMessage({
       type: "AD_EVENT",
-      payload: { adId: currentAd.id, event: "impression" },
+      payload: {
+        adId: currentAd.id,
+        event: "impression",
+        ...(currentAd.campaignId ? { campaignId: currentAd.campaignId } : {}),
+      },
     });
   }
 }

@@ -72,7 +72,11 @@ type ApiMessage =
   | { type: "GET_AD"; payload?: undefined }
   | {
       type: "AD_EVENT";
-      payload: { adId: number; event: "impression" | "click" };
+      payload: {
+        adId: number;
+        event: "impression" | "click";
+        campaignId?: number;
+      };
     }
   | { type: "GET_WALLET"; payload?: { limit?: number } }
   | { type: "GET_HEALTH"; payload?: undefined }
@@ -167,11 +171,16 @@ export function postAdEvent(
   adId: number,
   userId: string,
   event: "impression" | "click",
+  campaignId?: number,
 ): Promise<unknown> {
+  const body: Record<string, unknown> = { adId, userId, event };
+  if (typeof campaignId === "number" && campaignId > 0) {
+    body.campaignId = campaignId;
+  }
   return requestJson(`${API_BASE}/ad/event`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ adId, userId, event }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -371,15 +380,22 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
     case "GET_AD":
       return { ok: true, data: await getAdNext() };
 
-    case "AD_EVENT":
-      return {
-        ok: true,
-        data: await postAdEvent(
-          message.payload.adId,
-          userId,
-          message.payload.event,
-        ),
+    case "AD_EVENT": {
+      const data = await postAdEvent(
+        message.payload.adId,
+        userId,
+        message.payload.event,
+        message.payload.campaignId,
+      );
+      const payload = data as {
+        data?: { revenue?: { credited_rupees?: number } | null };
       };
+      const credited = Number(payload.data?.revenue?.credited_rupees ?? 0);
+      if (credited > 0) {
+        await updateStoredEarnings(credited);
+      }
+      return { ok: true, data };
+    }
 
     case "GET_WALLET": {
       const limit = message.payload?.limit ?? 10;

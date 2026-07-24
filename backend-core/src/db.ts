@@ -126,7 +126,46 @@ db.exec(`
     resolved_at TEXT,
     FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
   );
+
+  -- Ad impression revenue split (integer paise). 60% earner / 20% pool / 20% platform.
+  CREATE TABLE IF NOT EXISTS revenue_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    ad_event_id INTEGER,
+    user_id TEXT NOT NULL,
+    gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
+    earner_paise INTEGER NOT NULL CHECK (earner_paise >= 0),
+    pool_paise INTEGER NOT NULL CHECK (pool_paise >= 0),
+    platform_paise INTEGER NOT NULL CHECK (platform_paise >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (earner_paise + pool_paise + platform_paise = gross_paise),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_revenue_events_campaign
+    ON revenue_events (campaign_id, created_at DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_revenue_events_user
+    ON revenue_events (user_id, created_at DESC);
 `);
+
+/** Percent shares of campaign impression gross spend (must sum to 100). */
+export const EARNER_SHARE = 60;
+export const POOL_SHARE = 20;
+export const PLATFORM_SHARE = 20;
+
+/** Split integer paise so earner + pool + platform === gross (remainder → platform). */
+export function splitRevenuePaise(grossPaise: number): {
+  earner_paise: number;
+  pool_paise: number;
+  platform_paise: number;
+} {
+  const gross = Math.max(0, Math.floor(grossPaise));
+  const earner_paise = Math.floor((gross * EARNER_SHARE) / 100);
+  const pool_paise = Math.floor((gross * POOL_SHARE) / 100);
+  const platform_paise = gross - earner_paise - pool_paise;
+  return { earner_paise, pool_paise, platform_paise };
+}
 
 const transactionColumns = db.pragma("table_info(transactions)") as Array<{
   name: string;
@@ -458,6 +497,10 @@ export interface LedgerStats {
   totalTransactions: number;
   totalPaidOut: number;
   totalSurveyResponses: number;
+  revenueGrossPaise: number;
+  revenueEarnerPaise: number;
+  revenuePoolPaise: number;
+  revenuePlatformPaise: number;
 }
 
 export interface RecentTransaction {
@@ -491,6 +534,14 @@ const sumTransactionAmounts = db.prepare(
 const countSurveyResponses = db.prepare(
   `SELECT COUNT(*) AS count FROM survey_responses`,
 );
+const sumRevenueShares = db.prepare(`
+  SELECT
+    COALESCE(SUM(gross_paise), 0) AS gross_paise,
+    COALESCE(SUM(earner_paise), 0) AS earner_paise,
+    COALESCE(SUM(pool_paise), 0) AS pool_paise,
+    COALESCE(SUM(platform_paise), 0) AS platform_paise
+  FROM revenue_events
+`);
 
 const selectRecentTransactions = db.prepare(`
   SELECT id, user_id, amount, layer, created_at
@@ -536,12 +587,22 @@ export function getLedgerStats(): LedgerStats {
   const transactions = countTransactions.get() as { count: number };
   const paidOut = sumTransactionAmounts.get() as { total: number };
   const surveyResponses = countSurveyResponses.get() as { count: number };
+  const revenue = sumRevenueShares.get() as {
+    gross_paise: number;
+    earner_paise: number;
+    pool_paise: number;
+    platform_paise: number;
+  };
 
   return {
     totalUsers: users.count,
     totalTransactions: transactions.count,
     totalPaidOut: paidOut.total,
     totalSurveyResponses: surveyResponses.count,
+    revenueGrossPaise: revenue.gross_paise,
+    revenueEarnerPaise: revenue.earner_paise,
+    revenuePoolPaise: revenue.pool_paise,
+    revenuePlatformPaise: revenue.platform_paise,
   };
 }
 
@@ -932,6 +993,7 @@ export const resetLedger = db.transaction(() => {
     DELETE FROM transactions;
     DELETE FROM redemptions;
     DELETE FROM ad_events;
+    DELETE FROM revenue_events;
     DELETE FROM survey_responses;
     UPDATE users SET balance = 0;
   `);
@@ -1125,6 +1187,17 @@ const insertCampaignAdEvent = db.prepare(`
   VALUES (0, ?, ?, ?)
 `);
 
+const insertRevenueEvent = db.prepare(`
+  INSERT INTO revenue_events (
+    campaign_id, ad_event_id, user_id,
+    gross_paise, earner_paise, pool_paise, platform_paise
+  )
+  VALUES (
+    @campaign_id, @ad_event_id, @user_id,
+    @gross_paise, @earner_paise, @pool_paise, @platform_paise
+  )
+`);
+
 const incrementCampaignSpend = db.prepare(`
   UPDATE campaigns
   SET
@@ -1249,7 +1322,18 @@ export function getServableCampaign(): Campaign | null {
 }
 
 export type RecordCampaignImpressionResult =
-  | { ok: true; spent_paise: number; status: CampaignStatus }
+  | {
+      ok: true;
+      spent_paise: number;
+      status: CampaignStatus;
+      revenue: {
+        gross_paise: number;
+        earner_paise: number;
+        pool_paise: number;
+        platform_paise: number;
+        credited_rupees: number;
+      } | null;
+    }
   | { ok: false; reason: "not_found" | "not_servable" };
 
 export const recordCampaignImpression = db.transaction(
@@ -1262,11 +1346,68 @@ export const recordCampaignImpression = db.transaction(
       return { ok: false, reason: "not_servable" };
     }
 
+    // Cost per impression in integer paise (micro-rupee unit for splits).
     const cost = Math.floor(row.cpm_paise / 1000);
-    insertCampaignAdEvent.run(userId, "impression", campaignId);
+    const adEvent = insertCampaignAdEvent.run(userId, "impression", campaignId);
+    const adEventId = Number(adEvent.lastInsertRowid);
+
     const update = incrementCampaignSpend.run({ id: campaignId, cost });
     if (update.changes === 0) {
       return { ok: false, reason: "not_servable" };
+    }
+
+    let revenue: {
+      gross_paise: number;
+      earner_paise: number;
+      pool_paise: number;
+      platform_paise: number;
+      credited_rupees: number;
+    } | null = null;
+
+    if (cost > 0) {
+      const shares = splitRevenuePaise(cost);
+      insertRevenueEvent.run({
+        campaign_id: campaignId,
+        ad_event_id: adEventId,
+        user_id: userId,
+        gross_paise: cost,
+        earner_paise: shares.earner_paise,
+        pool_paise: shares.pool_paise,
+        platform_paise: shares.platform_paise,
+      });
+
+      // Credit earner share to the viewing user's balance (paise → rupees).
+      // Nonce is tied to the ad_event row so the credit cannot double inside this write.
+      const credited_rupees = shares.earner_paise / 100;
+      if (shares.earner_paise > 0) {
+        upsertUser.run(userId);
+        try {
+          insertTx.run({
+            userId,
+            amount: credited_rupees,
+            layer: "adRevenueShare",
+            nonce: `adrev:${adEventId}`,
+            partnerId: null,
+          });
+        } catch (err: unknown) {
+          if (
+            err instanceof Error &&
+            err.message.includes("UNIQUE constraint failed")
+          ) {
+            throw new DuplicateTransactionError();
+          }
+          throw err;
+        }
+        creditBalance.run({ userId, amount: credited_rupees });
+      }
+
+      revenue = {
+        gross_paise: cost,
+        earner_paise: shares.earner_paise,
+        pool_paise: shares.pool_paise,
+        platform_paise: shares.platform_paise,
+        credited_rupees,
+      };
     }
 
     const updated = selectCampaignById.get(campaignId) as CampaignRow;
@@ -1274,6 +1415,7 @@ export const recordCampaignImpression = db.transaction(
       ok: true,
       spent_paise: updated.spent_paise,
       status: updated.status,
+      revenue,
     };
   },
 );
