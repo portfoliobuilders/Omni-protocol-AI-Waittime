@@ -33,6 +33,7 @@ import {
   getTransactions,
   getUserRedemptions,
   listTopupRequests,
+  MIN_CPM_PAISE,
   pauseAdvertiserCampaign,
   PLATFORM_SHARE,
   POOL_SHARE,
@@ -942,6 +943,18 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
 
     const advertiserEmail =
       typeof body.advertiser_email === "string" ? body.advertiser_email : "";
+    const cpm_paise = parsePositiveIntField(body.cpm_paise, "cpm_paise");
+    const total_budget_paise = parsePositiveIntField(
+      body.total_budget_paise,
+      "total_budget_paise",
+    );
+    if (cpm_paise < MIN_CPM_PAISE) {
+      throw new ValidationError(
+        `cpm_paise must be at least ${MIN_CPM_PAISE} (₹${MIN_CPM_PAISE / 100} CPM) so each impression spends at least 1 paise.`,
+      );
+    }
+
+    // Create advertiser only after field validation succeeds.
     const advertiser = getOrCreateAdvertiser(advertiserEmail);
 
     const campaign = createCampaign({
@@ -950,11 +963,8 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
       body: typeof body.body === "string" ? body.body : "",
       cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
       cta_url: typeof body.cta_url === "string" ? body.cta_url : "",
-      cpm_paise: parsePositiveIntField(body.cpm_paise, "cpm_paise"),
-      total_budget_paise: parsePositiveIntField(
-        body.total_budget_paise,
-        "total_budget_paise",
-      ),
+      cpm_paise,
+      total_budget_paise,
     });
 
     const data: Record<string, unknown> = {
@@ -2835,14 +2845,14 @@ const ADVERTISE_PAGE_HTML = `<!DOCTYPE html>
         <div class="row">
           <div class="field">
             <label for="cpm">CPM (₹)</label>
-            <input id="cpm" type="number" min="1" step="1" value="50" required>
+            <input id="cpm" type="number" min="10" step="1" value="50" required>
           </div>
           <div class="field">
             <label for="budget">Budget (₹)</label>
             <input id="budget" type="number" min="1" step="1" value="500" required>
           </div>
         </div>
-        <p class="hint">Budget and CPM are converted to paise on submit (₹1 = 100 paise).</p>
+        <p class="hint">Budget and CPM are converted to paise on submit (₹1 = 100 paise). Minimum CPM is ₹10 so each impression spends at least 1 paise.</p>
         <button type="submit" id="submitBtn">Submit for review</button>
       </form>
       <aside class="card">
@@ -2892,6 +2902,12 @@ const ADVERTISE_PAGE_HTML = `<!DOCTYPE html>
       var budgetPaise = rupeesToPaise(document.getElementById("budget").value);
       if (!Number.isInteger(cpmPaise) || !Number.isInteger(budgetPaise)) {
         err.textContent = "CPM and budget must be positive amounts in rupees.";
+        err.style.display = "block";
+        btn.disabled = false;
+        return;
+      }
+      if (cpmPaise < 1000) {
+        err.textContent = "CPM must be at least ₹10 so each impression spends at least 1 paise.";
         err.style.display = "block";
         btn.disabled = false;
         return;

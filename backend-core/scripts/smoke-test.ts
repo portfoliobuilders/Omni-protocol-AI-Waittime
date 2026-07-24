@@ -370,6 +370,20 @@ async function checkAds(): Promise<void> {
 async function checkRevenueShare(): Promise<void> {
   const label = "8b. Campaign revenue share 60/20/20";
   try {
+    const lowCpm = await request("POST", "/api/v1/campaigns", {
+      advertiser_email: `smoke_lowcpm_${Date.now()}@example.com`,
+      headline: "Too-low CPM",
+      body: "Should be rejected because CPM under ₹10 spends 0 paise per impression.",
+      cta_label: "Open",
+      cta_url: "https://example.com",
+      cpm_paise: 500,
+      total_budget_paise: 10000,
+    });
+    if (lowCpm.status !== 400 || lowCpm.json.success !== false) {
+      fail(label, `expected low CPM reject, got ${lowCpm.status} ${JSON.stringify(lowCpm.json)}`);
+      return;
+    }
+
     const email = `smoke_adv_${Date.now()}@example.com`;
     const create = await request("POST", "/api/v1/campaigns", {
       advertiser_email: email,
