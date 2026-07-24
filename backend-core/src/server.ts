@@ -41,8 +41,6 @@ import {
   requestRedemption,
   resetLedger,
   resolveRedemption,
-  resolveTopupRequest,
-  resumeAdvertiserCampaign,
   reviewCampaign,
   setAdActive,
   setPartnerActive,
@@ -112,14 +110,6 @@ interface CreateCampaignRequestBody {
 
 interface ReviewCampaignBody {
   decision?: unknown;
-}
-
-interface TopupRequestBody {
-  amount_paise?: unknown;
-}
-
-interface ResolveTopupBody {
-  status?: unknown;
 }
 
 interface RedeemRequestBody {
@@ -924,12 +914,9 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
       return n;
     };
 
-    const advertiserEmail =
-      typeof body.advertiser_email === "string" ? body.advertiser_email : "";
-    const advertiser = getOrCreateAdvertiser(advertiserEmail);
-
     const campaign = createCampaign({
-      advertiser_email: advertiser.email,
+      advertiser_email:
+        typeof body.advertiser_email === "string" ? body.advertiser_email : "",
       headline: typeof body.headline === "string" ? body.headline : "",
       body: typeof body.body === "string" ? body.body : "",
       cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
@@ -941,21 +928,13 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
       ),
     });
 
-    const data: Record<string, unknown> = {
-      id: campaign.id,
-      status: campaign.status,
-      note: "Campaign submitted for manual review. It will go live after an admin approves it.",
-    };
-
-    if (advertiser.isNew) {
-      data.mgmt_key = advertiser.mgmt_key;
-      data.mgmt_key_note =
-        "Save this management key now — it is shown only once. You will need it to log in at /advertiser.";
-    }
-
     res.status(201).json({
       success: true,
-      data,
+      data: {
+        id: campaign.id,
+        status: campaign.status,
+        note: "Campaign submitted for manual review. It will go live after an admin approves it.",
+      },
     });
   } catch (error) {
     if (error instanceof ValidationError || error instanceof ContentValidationError) {
@@ -975,182 +954,18 @@ app.post("/api/v1/campaigns", (req: Request, res: Response) => {
 });
 
 app.get("/api/v1/campaigns/stats", safeRoute((req, res) => {
-  const auth = requireAdvertiser(req, res);
-  if (!auth) {
-    return;
+  const email =
+    typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+
+  if (!email) {
+    throw new ValidationError("email query parameter is required.");
   }
 
   res.status(200).json({
     success: true,
-    data: { campaigns: getCampaignStats(auth.email) },
+    data: { campaigns: getCampaignStats(email) },
   });
 }));
-
-app.get("/api/v1/advertiser/campaigns", safeRoute((req, res) => {
-  const auth = requireAdvertiser(req, res);
-  if (!auth) {
-    return;
-  }
-
-  res.status(200).json({
-    success: true,
-    data: { campaigns: getCampaignStats(auth.email) },
-  });
-}));
-
-app.post(
-  "/api/v1/advertiser/campaigns/:id/pause",
-  (req: Request, res: Response) => {
-    try {
-      const auth = requireAdvertiser(req, res);
-      if (!auth) {
-        return;
-      }
-
-      const id = parsePositiveInt(req.params.id, "id");
-      const result = pauseAdvertiserCampaign(auth.email, id);
-      if (!result.ok) {
-        const message =
-          result.reason === "not_found"
-            ? "Campaign not found."
-            : result.reason === "not_owner"
-              ? "Campaign not found."
-              : "Campaign can only be paused when active.";
-        res.status(result.reason === "invalid_transition" ? 400 : 404).json({
-          success: false,
-          message,
-        });
-        return;
-      }
-
-      res.status(200).json({
-        success: true,
-        data: { id, status: result.status },
-      });
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-        });
-        return;
-      }
-
-      console.error("[Omni Advertiser] Pause campaign error", error);
-      res.status(500).json({
-        success: false,
-        message: "Internal server error.",
-      });
-    }
-  },
-);
-
-app.post(
-  "/api/v1/advertiser/campaigns/:id/resume",
-  (req: Request, res: Response) => {
-    try {
-      const auth = requireAdvertiser(req, res);
-      if (!auth) {
-        return;
-      }
-
-      const id = parsePositiveInt(req.params.id, "id");
-      const result = resumeAdvertiserCampaign(auth.email, id);
-      if (!result.ok) {
-        const message =
-          result.reason === "not_found"
-            ? "Campaign not found."
-            : result.reason === "not_owner"
-              ? "Campaign not found."
-              : "Campaign can only be resumed when paused.";
-        res.status(result.reason === "invalid_transition" ? 400 : 404).json({
-          success: false,
-          message,
-        });
-        return;
-      }
-
-      res.status(200).json({
-        success: true,
-        data: { id, status: result.status },
-      });
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-        });
-        return;
-      }
-
-      console.error("[Omni Advertiser] Resume campaign error", error);
-      res.status(500).json({
-        success: false,
-        message: "Internal server error.",
-      });
-    }
-  },
-);
-
-app.post(
-  "/api/v1/advertiser/campaigns/:id/topup",
-  (req: Request, res: Response) => {
-    try {
-      const auth = requireAdvertiser(req, res);
-      if (!auth) {
-        return;
-      }
-
-      const id = parsePositiveInt(req.params.id, "id");
-      const amountRaw = (req.body as TopupRequestBody).amount_paise;
-      const amount_paise =
-        typeof amountRaw === "number"
-          ? amountRaw
-          : typeof amountRaw === "string"
-            ? Number(amountRaw)
-            : NaN;
-
-      if (!Number.isInteger(amount_paise) || amount_paise <= 0) {
-        throw new ValidationError("amount_paise must be a positive integer.");
-      }
-
-      const result = requestCampaignTopup(auth.email, id, amount_paise);
-      if (!result.ok) {
-        const message =
-          result.reason === "invalid_amount"
-            ? "amount_paise must be a positive integer."
-            : "Campaign not found.";
-        res.status(result.reason === "invalid_amount" ? 400 : 404).json({
-          success: false,
-          message,
-        });
-        return;
-      }
-
-      res.status(201).json({
-        success: true,
-        data: {
-          topup: result.topup,
-          note: "Requested — we'll email a UPI payment link; budget updates once paid.",
-        },
-      });
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-        });
-        return;
-      }
-
-      console.error("[Omni Advertiser] Top-up request error", error);
-      res.status(500).json({
-        success: false,
-        message: "Internal server error.",
-      });
-    }
-  },
-);
 
 app.post("/api/v1/redeem", (req: Request, res: Response) => {
   try {
@@ -1258,6 +1073,72 @@ app.get("/api/v1/admin/ads", requireAdminKey, safeRoute((_req, res) => {
 }));
 
 app.get("/api/v1/admin/campaigns", requireAdminKey, safeRoute((_req, res) => {
+  res.status(200).json({
+    success: true,
+    data: { campaigns: getAllCampaignsAdmin() },
+  });
+}));
+
+app.post(
+  "/api/v1/admin/campaigns/:id/review",
+  requireAdminKey,
+  (req: Request, res: Response) => {
+    try {
+      const id = parsePositiveInt(req.params.id, "id");
+      const decisionRaw = (req.body as ReviewCampaignBody).decision;
+      const decision =
+        typeof decisionRaw === "string" ? decisionRaw.trim() : "";
+
+      if (decision !== "approve" && decision !== "reject") {
+        throw new ValidationError("decision must be 'approve' or 'reject'.");
+      }
+
+      const result = reviewCampaign(id, decision);
+
+      if (!result.ok) {
+        const message =
+          result.reason === "not_found"
+            ? "Campaign not found."
+            : result.reason === "not_pending"
+              ? "Campaign is not pending review."
+              : "Invalid review decision.";
+
+        res.status(result.reason === "not_found" ? 404 : 400).json({
+          success: false,
+          message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        data: { id, status: result.status },
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("[Omni Admin] Review campaign error", error);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error.",
+      });
+    }
+  },
+);
+
+app.get("/api/v1/admin/redemptions", requireAdminKey, safeRoute((req, res) => {
+  const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : undefined;
+  const status =
+    statusParam === "pending" || statusParam === "paid" || statusParam === "rejected"
+      ? statusParam
+      : undefined;
+
   res.status(200).json({
     success: true,
     data: { campaigns: getAllCampaignsAdmin() },
@@ -2081,10 +1962,6 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     <div id="campaignsTable"></div>
   </div>
   <div class="section">
-    <h2>Top-ups</h2>
-    <div id="topupsTable"></div>
-  </div>
-  <div class="section">
     <h2>Redemption Requests</h2>
     <div id="redemptionsPending"></div>
     <div id="redemptionsHistory" class="history-table"></div>
@@ -2287,59 +2164,6 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       var json = await response.json();
       if (!json.success) throw new Error("API returned an error response.");
       renderCampaigns(json.data.campaigns);
-    }
-    function renderTopups(topups) {
-      var container = document.getElementById("topupsTable");
-      if (!topups.length) {
-        container.innerHTML = '<div class="empty">No top-up requests yet.</div>';
-        return;
-      }
-      var rows = topups.map(function(t) {
-        var actions = t.status === "requested"
-          ? '<button type="button" class="btn-sm" data-topup-id="' + t.id + '" data-status="paid">Mark Paid</button>' +
-            '<button type="button" class="btn-sm btn-reject" data-topup-id="' + t.id + '" data-status="rejected">Reject</button>'
-          : '—';
-        return '<tr data-id="' + t.id + '">' +
-          '<td>' + t.id + '</td>' +
-          '<td>' + t.campaign_id + '</td>' +
-          '<td>' + esc(t.advertiser_email) + '</td>' +
-          '<td>' + esc(t.headline) + '</td>' +
-          '<td class="amount">' + esc(fmtPaise(t.amount_paise)) + '</td>' +
-          '<td>' + statusBadge(t.status) + '</td>' +
-          '<td>' + esc(fmtTime(t.created_at)) + '</td>' +
-          '<td>' + actions + '</td>' +
-          '</tr>';
-      }).join("");
-      container.innerHTML = '<table><thead><tr><th>ID</th><th>Campaign</th><th>Advertiser</th><th>Headline</th><th>Amount</th><th>Status</th><th>Requested</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table>';
-      container.querySelectorAll("[data-topup-id]").forEach(function(btn) {
-        btn.addEventListener("click", function() {
-          resolveTopup(Number(btn.getAttribute("data-topup-id")), btn.getAttribute("data-status"));
-        });
-      });
-    }
-    async function resolveTopup(id, status) {
-      hideError();
-      try {
-        var response = await fetch(adminUrl("/api/v1/admin/topups/" + id + "/resolve"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: status }),
-        });
-        var json = await response.json();
-        if (!response.ok || !json.success) {
-          throw new Error(json.message || "Failed to resolve top-up.");
-        }
-        await Promise.all([loadTopups(), loadCampaigns()]);
-      } catch (err) {
-        showError(err instanceof Error ? err.message : "Failed to resolve top-up.");
-      }
-    }
-    async function loadTopups() {
-      var response = await fetch(adminUrl("/api/v1/admin/topups"));
-      if (!response.ok) throw new Error("Failed to load top-ups.");
-      var json = await response.json();
-      if (!json.success) throw new Error("API returned an error response.");
-      renderTopups(json.data.topups);
     }
     function methodLabel(method) {
       return method === "amazon_voucher" ? "Amazon Pay voucher" : "UPI";
@@ -2590,9 +2414,8 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
           fetch(adminUrl("/api/v1/admin/ads")),
           fetch(adminUrl("/api/v1/admin/redemptions")),
           fetch(adminUrl("/api/v1/admin/campaigns")),
-          fetch(adminUrl("/api/v1/admin/topups")),
         ]);
-        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok || !responses[5].ok || !responses[6].ok || !responses[7].ok) {
+        if (!responses[0].ok || !responses[1].ok || !responses[2].ok || !responses[3].ok || !responses[4].ok || !responses[5].ok || !responses[6].ok) {
           throw new Error("One or more API requests failed.");
         }
         var statsJson = await responses[0].json();
@@ -2602,8 +2425,7 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
         var adsJson = await responses[4].json();
         var redemptionsJson = await responses[5].json();
         var campaignsJson = await responses[6].json();
-        var topupsJson = await responses[7].json();
-        if (!statsJson.success || !partnersJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success || !campaignsJson.success || !topupsJson.success) {
+        if (!statsJson.success || !partnersJson.success || !surveysJson.success || !txJson.success || !adsJson.success || !redemptionsJson.success || !campaignsJson.success) {
           throw new Error("API returned an error response.");
         }
         renderStats(statsJson.data);
@@ -2611,7 +2433,6 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
         renderSurveys(surveysJson.data.results);
         renderAdStats(adsJson.data);
         renderCampaigns(campaignsJson.data.campaigns);
-        renderTopups(topupsJson.data.topups);
         renderRedemptions(redemptionsJson.data.redemptions);
         renderTransactions(txJson.data.transactions);
       } catch (err) {
