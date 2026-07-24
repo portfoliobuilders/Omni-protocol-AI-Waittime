@@ -915,10 +915,11 @@ function detectActiveWaitState(): boolean {
 }
 
 function removeBox(): void {
-  const existing = document.getElementById(BOX_ID);
-  if (existing) {
-    existing.remove();
-  }
+  // Grok (and other SPAs) can rebuild the DOM and leave multiple nodes with the
+  // same id. Sweep all matches — getElementById only finds the first.
+  document.querySelectorAll(`#${BOX_ID}`).forEach((el) => {
+    el.remove();
+  });
   boxMounted = false;
   clearWaitTimer();
 }
@@ -1074,16 +1075,32 @@ function mountBox(box: HTMLElement): void {
 }
 
 async function showMindfulBreakBox(): Promise<void> {
-  const existing = document.getElementById(BOX_ID);
-  if (existing?.isConnected) {
+  const existingBoxes = Array.from(
+    document.querySelectorAll<HTMLElement>(`#${BOX_ID}`),
+  );
+  const connectedBoxes = existingBoxes.filter((el) => el.isConnected);
+
+  // Drop detached orphans left behind by SPA DOM rebuilds (notably Grok).
+  for (const el of existingBoxes) {
+    if (!el.isConnected) {
+      el.remove();
+    }
+  }
+
+  // Invalid HTML can still produce duplicate ids — keep one, remove the rest.
+  if (connectedBoxes.length > 1) {
+    for (const el of connectedBoxes.slice(1)) {
+      el.remove();
+    }
+  }
+
+  if (connectedBoxes[0]?.isConnected) {
     boxMounted = true;
     return;
   }
-  if (existing && !existing.isConnected) {
-    existing.remove();
-    boxMounted = false;
-  }
-  if (document.getElementById(BOX_ID)) return;
+
+  boxMounted = false;
+  if (document.querySelector(`#${BOX_ID}`)) return;
   if (claimedThisCycle || isClaiming) return;
   if (!currentSessionToken) return;
 
@@ -1215,8 +1232,17 @@ function evaluateWaitState(): void {
   isGenerating = active;
 
   if (active && !claimedThisCycle) {
-    const box = document.getElementById(BOX_ID);
-    if (box && !box.isConnected) {
+    const boxes = document.querySelectorAll(`#${BOX_ID}`);
+    let connectedCount = 0;
+    boxes.forEach((el) => {
+      if (el.isConnected) {
+        connectedCount += 1;
+      } else {
+        el.remove();
+        boxMounted = false;
+      }
+    });
+    if (connectedCount === 0) {
       boxMounted = false;
     }
     void showMindfulBreakBox();
