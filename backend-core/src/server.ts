@@ -15,6 +15,7 @@ import {
   createClaimSession,
   createPartner,
   DuplicateTransactionError,
+  EARNER_SHARE,
   getActiveAd,
   getAdStats,
   getAllCampaignsAdmin,
@@ -33,6 +34,8 @@ import {
   getUserRedemptions,
   listTopupRequests,
   pauseAdvertiserCampaign,
+  PLATFORM_SHARE,
+  POOL_SHARE,
   recordAdEvent,
   recordCampaignClick,
   recordCampaignImpression,
@@ -61,6 +64,12 @@ const REWARD_ECONOMICS = {
   minRedemption: 100,
   minWaitSeconds: 5,
   tier3Seconds: 15,
+  /** Campaign impression revenue split (percent). Enforced server-side in paise. */
+  revenueShare: {
+    earner: EARNER_SHARE,
+    pool: POOL_SHARE,
+    platform: PLATFORM_SHARE,
+  },
 } as const;
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
@@ -852,7 +861,14 @@ app.post("/api/v1/ad/event", (req: Request, res: Response) => {
           });
           return;
         }
-        res.status(200).json({ success: true });
+        res.status(200).json({
+          success: true,
+          data: {
+            spent_paise: result.spent_paise,
+            status: result.status,
+            revenue: result.revenue,
+          },
+        });
         return;
       }
 
@@ -2021,6 +2037,7 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="stat-card"><div class="stat-label">Transactions</div><div class="stat-value" id="statTx">—</div></div>
     <div class="stat-card"><div class="stat-label">Total Paid Out</div><div class="stat-value" id="statPaid">—</div></div>
     <div class="stat-card"><div class="stat-label">Survey Responses</div><div class="stat-value" id="statSurvey">—</div></div>
+    <div class="stat-card"><div class="stat-label">Ad Revenue (earner/pool/platform)</div><div class="stat-value" id="statRevenue" style="font-size:1rem">—</div></div>
   </div>
   <div class="section">
     <h2>Partners</h2>
@@ -2118,6 +2135,13 @@ const ADMIN_DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById("statTx").textContent = data.totalTransactions;
       document.getElementById("statPaid").textContent = fmtMoney(data.totalPaidOut);
       document.getElementById("statSurvey").textContent = data.totalSurveyResponses;
+      function fmtPaise(paise) {
+        return "₹" + (Number(paise || 0) / 100).toFixed(2);
+      }
+      document.getElementById("statRevenue").textContent =
+        fmtPaise(data.revenueEarnerPaise) + " / " +
+        fmtPaise(data.revenuePoolPaise) + " / " +
+        fmtPaise(data.revenuePlatformPaise);
     }
     function renderPartners(partners) {
       var container = document.getElementById("partnersTable");

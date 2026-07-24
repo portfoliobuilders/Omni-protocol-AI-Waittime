@@ -119,13 +119,19 @@ async function checkConfig(): Promise<void> {
   const label = "2. GET /api/v1/config (INR)";
   const { status, json } = await request("GET", "/api/v1/config");
   const data = json.data as Record<string, unknown> | undefined;
+  const share = data?.revenueShare as
+    | { earner?: number; pool?: number; platform?: number }
+    | undefined;
   if (
     status === 200 &&
     json.success === true &&
     data?.currency === "INR" &&
-    data?.symbol === "₹"
+    data?.symbol === "₹" &&
+    share?.earner === 60 &&
+    share?.pool === 20 &&
+    share?.platform === 20
   ) {
-    pass(label);
+    pass(label, "revenueShare 60/20/20");
   } else {
     fail(label, `status=${status} data=${JSON.stringify(data)}`);
   }
@@ -324,26 +330,117 @@ async function checkAds(): Promise<void> {
       fail(label, `ad/next status=${status}`);
       return;
     }
-    const data = json.data as { ad?: { id: number } | null };
+    const data = json.data as {
+      ad?: { id: number } | null;
+      source?: string;
+      campaignId?: number;
+    };
     if (!data.ad) {
       pass(label, "no active ad (null tolerated)");
       return;
     }
-    const imp = await request("POST", "/api/v1/ad/event", {
+    const body: Record<string, unknown> = {
       adId: data.ad.id,
       userId,
       event: "impression",
-    });
-    const clk = await request("POST", "/api/v1/ad/event", {
+    };
+    if (data.source === "campaign" && data.campaignId) {
+      body.campaignId = data.campaignId;
+    }
+    const imp = await request("POST", "/api/v1/ad/event", body);
+    const clkBody: Record<string, unknown> = {
       adId: data.ad.id,
       userId,
       event: "click",
-    });
+    };
+    if (data.source === "campaign" && data.campaignId) {
+      clkBody.campaignId = data.campaignId;
+    }
+    const clk = await request("POST", "/api/v1/ad/event", clkBody);
     if (imp.status === 200 && imp.json.success === true && clk.status === 200 && clk.json.success === true) {
-      pass(label, `ad id=${data.ad.id}`);
+      pass(label, `ad id=${data.ad.id} source=${data.source ?? "unknown"}`);
     } else {
       fail(label, `imp=${imp.status} click=${clk.status}`);
     }
+  } catch (err) {
+    fail(label, err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function checkRevenueShare(): Promise<void> {
+  const label = "8b. Campaign revenue share 60/20/20";
+  try {
+    const email = `smoke_adv_${Date.now()}@example.com`;
+    const create = await request("POST", "/api/v1/campaigns", {
+      advertiser_email: email,
+      headline: "Smoke Revenue Share",
+      body: "Verifies 60/20/20 paise split on impressions.",
+      cta_label: "Open",
+      cta_url: "https://example.com",
+      // ₹100 CPM → 10000 paise → 10 paise per impression
+      cpm_paise: 10000,
+      total_budget_paise: 100000,
+    });
+    if (create.status !== 201 || create.json.success !== true) {
+      fail(label, `create campaign ${create.status}`);
+      return;
+    }
+    const created = create.json.data as { id?: number; mgmt_key?: string };
+    const campaignId = created.id;
+    if (!campaignId) {
+      fail(label, "missing campaign id");
+      return;
+    }
+
+    const review = await request(
+      "POST",
+      `/api/v1/admin/campaigns/${campaignId}/review`,
+      { decision: "approve" },
+      Boolean(ADMIN_KEY),
+    );
+    if (review.status !== 200 || review.json.success !== true) {
+      fail(label, `approve status=${review.status} body=${JSON.stringify(review.json)}`);
+      return;
+    }
+
+    const before = await getBalance();
+    const imp = await request("POST", "/api/v1/ad/event", {
+      adId: campaignId,
+      userId,
+      event: "impression",
+      campaignId,
+    });
+    if (imp.status !== 200 || imp.json.success !== true) {
+      fail(label, `impression status=${imp.status} body=${JSON.stringify(imp.json)}`);
+      return;
+    }
+    const revenue = (imp.json.data as { revenue?: {
+      gross_paise?: number;
+      earner_paise?: number;
+      pool_paise?: number;
+      platform_paise?: number;
+      credited_rupees?: number;
+    } | null })?.revenue;
+
+    if (
+      !revenue ||
+      revenue.gross_paise !== 10 ||
+      revenue.earner_paise !== 6 ||
+      revenue.pool_paise !== 2 ||
+      revenue.platform_paise !== 2 ||
+      revenue.credited_rupees !== 0.06
+    ) {
+      fail(label, `bad split ${JSON.stringify(revenue)}`);
+      return;
+    }
+
+    const after = await getBalance();
+    if (Math.abs(after - (before + 0.06)) > 0.001) {
+      fail(label, `balance ${before} → ${after}, expected +0.06`);
+      return;
+    }
+
+    pass(label, "10 paise → 6/2/2 + ₹0.06 earner credit");
   } catch (err) {
     fail(label, err instanceof Error ? err.message : String(err));
   }
@@ -492,6 +589,7 @@ async function main(): Promise<void> {
   if (sessionToken) await checkReusedToken(sessionToken);
   await checkSurvey();
   await checkAds();
+  await checkRevenueShare();
   await checkRedemption();
   await checkAdminEndpoints();
   await checkPartnerFlow();
