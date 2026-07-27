@@ -9,6 +9,12 @@ const USER_ID_KEY = "omniUserId";
 
 let cachedUserId: string | null = null;
 
+export interface RevenueShareConfig {
+  earner: number;
+  pool: number;
+  platform: number;
+}
+
 export interface RewardConfig {
   currency: string;
   symbol: string;
@@ -17,7 +23,14 @@ export interface RewardConfig {
   minRedemption: number;
   minWaitSeconds: number;
   tier3Seconds: number;
+  revenueShare: RevenueShareConfig;
 }
+
+const DEFAULT_REVENUE_SHARE: RevenueShareConfig = {
+  earner: 60,
+  pool: 20,
+  platform: 20,
+};
 
 const DEFAULT_REWARD_CONFIG: RewardConfig = {
   currency: "INR",
@@ -27,6 +40,7 @@ const DEFAULT_REWARD_CONFIG: RewardConfig = {
   minRedemption: 100,
   minWaitSeconds: 5,
   tier3Seconds: 15,
+  revenueShare: DEFAULT_REVENUE_SHARE,
 };
 
 const CONFIG_TTL_MS = 10 * 60 * 1000;
@@ -212,6 +226,22 @@ export function getRedemptions(userId: string): Promise<unknown> {
   );
 }
 
+function parseRevenueShare(value: unknown): RevenueShareConfig {
+  if (typeof value !== "object" || value === null) {
+    return DEFAULT_REVENUE_SHARE;
+  }
+  const obj = value as Record<string, unknown>;
+  const pickPct = (key: keyof RevenueShareConfig, fallback: number): number => {
+    const n = obj[key];
+    return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    earner: pickPct("earner", DEFAULT_REVENUE_SHARE.earner),
+    pool: pickPct("pool", DEFAULT_REVENUE_SHARE.pool),
+    platform: pickPct("platform", DEFAULT_REVENUE_SHARE.platform),
+  };
+}
+
 function parseConfigResponse(json: unknown): RewardConfig {
   const raw =
     typeof json === "object" && json !== null
@@ -239,6 +269,7 @@ function parseConfigResponse(json: unknown): RewardConfig {
     minRedemption: pick("minRedemption", DEFAULT_REWARD_CONFIG.minRedemption),
     minWaitSeconds: pick("minWaitSeconds", DEFAULT_REWARD_CONFIG.minWaitSeconds),
     tier3Seconds: pick("tier3Seconds", DEFAULT_REWARD_CONFIG.tier3Seconds),
+    revenueShare: parseRevenueShare(obj.revenueShare),
   };
 }
 
