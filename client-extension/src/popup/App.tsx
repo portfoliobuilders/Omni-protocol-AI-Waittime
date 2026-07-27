@@ -66,6 +66,12 @@ const LAYER_LABELS: Record<string, string> = {
   passiveDepinLayer: "Passive DePIN Layer",
 };
 
+type RevenueShareConfig = {
+  earner: number;
+  pool: number;
+  platform: number;
+};
+
 type RewardConfig = {
   currency: string;
   symbol: string;
@@ -74,6 +80,13 @@ type RewardConfig = {
   minRedemption: number;
   minWaitSeconds: number;
   tier3Seconds: number;
+  revenueShare: RevenueShareConfig;
+};
+
+const FALLBACK_REVENUE_SHARE: RevenueShareConfig = {
+  earner: 60,
+  pool: 20,
+  platform: 20,
 };
 
 const FALLBACK_REWARD_CONFIG: RewardConfig = {
@@ -84,6 +97,7 @@ const FALLBACK_REWARD_CONFIG: RewardConfig = {
   minRedemption: 100,
   minWaitSeconds: 5,
   tier3Seconds: 15,
+  revenueShare: FALLBACK_REVENUE_SHARE,
 };
 
 function formatMoney(symbol: string, value: number): string {
@@ -109,6 +123,22 @@ const LAYERS: LayerToggle[] = [
   },
 ];
 
+function parseRevenueShare(value: unknown): RevenueShareConfig {
+  if (typeof value !== "object" || value === null) {
+    return FALLBACK_REVENUE_SHARE;
+  }
+  const obj = value as Record<string, unknown>;
+  const pickPct = (key: keyof RevenueShareConfig, fallback: number): number => {
+    const n = obj[key];
+    return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    earner: pickPct("earner", FALLBACK_REVENUE_SHARE.earner),
+    pool: pickPct("pool", FALLBACK_REVENUE_SHARE.pool),
+    platform: pickPct("platform", FALLBACK_REVENUE_SHARE.platform),
+  };
+}
+
 function parseRewardConfig(data: unknown): RewardConfig {
   if (typeof data !== "object" || data === null) return FALLBACK_REWARD_CONFIG;
   const obj = data as Record<string, unknown>;
@@ -127,6 +157,7 @@ function parseRewardConfig(data: unknown): RewardConfig {
     minRedemption: pick("minRedemption", FALLBACK_REWARD_CONFIG.minRedemption),
     minWaitSeconds: pick("minWaitSeconds", FALLBACK_REWARD_CONFIG.minWaitSeconds),
     tier3Seconds: pick("tier3Seconds", FALLBACK_REWARD_CONFIG.tier3Seconds),
+    revenueShare: parseRevenueShare(obj.revenueShare),
   };
 }
 
@@ -635,7 +666,11 @@ export default function App() {
             {formatMoney(rewardConfig.symbol, rewardConfig.tier2Amount)} after{" "}
             {rewardConfig.minWaitSeconds} seconds, or answer one quick question after{" "}
             {rewardConfig.tier3Seconds} seconds to earn{" "}
-            {formatMoney(rewardConfig.symbol, rewardConfig.tier3Amount)}. Credits are
+            {formatMoney(rewardConfig.symbol, rewardConfig.tier3Amount)}. When a
+            sponsored ad is shown, that ad spend is split{" "}
+            {rewardConfig.revenueShare.earner}% to you,{" "}
+            {rewardConfig.revenueShare.pool}% to the community pool, and{" "}
+            {rewardConfig.revenueShare.platform}% to the platform. Credits are
             experimental during our early release. Once your balance reaches{" "}
             {formatMoney(rewardConfig.symbol, rewardConfig.minRedemption)} you can request a
             redemption (Amazon Pay voucher or UPI), which we currently process manually
