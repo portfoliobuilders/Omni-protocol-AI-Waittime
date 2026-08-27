@@ -1,6 +1,6 @@
-// Local dev: set API_BASE_URL to http://localhost:3001 and re-add
-// "http://localhost:3001/*" to host_permissions in public/manifest.json.
-const API_BASE_URL = "https://omni-protocol-ai-waittime-production.up.railway.app";
+// Default local API. Set OMNI_API_BASE in .env.example for deployment.
+// For local Chrome loads, host_permissions must include this origin.
+const API_BASE_URL = "http://localhost:3001";
 const API_BASE = `${API_BASE_URL}/api/v1`;
 const HEALTH_URL = `${API_BASE_URL}/health`;
 const REQUEST_TIMEOUT_MS = 5000;
@@ -9,41 +9,33 @@ const USER_ID_KEY = "omniUserId";
 
 let cachedUserId: string | null = null;
 
-export interface RewardConfig {
+export interface PlatformConfig {
   currency: string;
   symbol: string;
-  tier2Amount: number;
-  tier3Amount: number;
   minRedemption: number;
   minWaitSeconds: number;
-  tier3Seconds: number;
+  userRevenueShareBps: number;
+  omniRevenueShareBps: number;
+  /** @deprecated Fixed rewards removed — kept only if server still returns them. */
+  tier2Amount?: number;
+  /** @deprecated Fixed rewards removed — kept only if server still returns them. */
+  tier3Amount?: number;
+  /** @deprecated Fixed rewards removed. */
+  tier3Seconds?: number;
 }
 
-const DEFAULT_REWARD_CONFIG: RewardConfig = {
+const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   currency: "INR",
   symbol: "₹",
-  tier2Amount: 2,
-  tier3Amount: 10,
   minRedemption: 100,
   minWaitSeconds: 5,
-  tier3Seconds: 15,
+  userRevenueShareBps: 6000,
+  omniRevenueShareBps: 4000,
 };
 
 const CONFIG_TTL_MS = 10 * 60 * 1000;
-let cachedRewardConfig: RewardConfig | null = null;
+let cachedPlatformConfig: PlatformConfig | null = null;
 let configFetchedAt = 0;
-
-export interface ClaimYieldPayload {
-  userId: string;
-  amount: number;
-  layer: string;
-  nonce: string;
-  sessionToken: string | null;
-  surveyQuestionId?: number;
-  surveyAnswer?: string;
-}
-
-type ClaimYieldClientPayload = Omit<ClaimYieldPayload, "userId">;
 
 interface Transaction {
   id: number;
@@ -67,8 +59,6 @@ interface Redemption {
 
 type ApiMessage =
   | { type: "SESSION_START"; payload?: undefined }
-  | { type: "CLAIM_YIELD"; payload: ClaimYieldClientPayload }
-  | { type: "GET_SURVEY"; payload?: undefined }
   | { type: "GET_AD"; payload?: undefined }
   | {
       type: "AD_EVENT";
@@ -147,20 +137,8 @@ export function startSession(userId: string): Promise<unknown> {
   });
 }
 
-export function claimYield(payload: ClaimYieldPayload): Promise<unknown> {
-  return requestJson(`${API_BASE}/yield`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
 export function getBalance(userId: string): Promise<unknown> {
   return requestJson(`${API_BASE}/balance/${encodeURIComponent(userId)}`);
-}
-
-export function getSurveyNext(userId: string): Promise<unknown> {
-  return requestJson(`${API_BASE}/survey/next/${encodeURIComponent(userId)}`);
 }
 
 export function getAdNext(): Promise<unknown> {
@@ -212,49 +190,61 @@ export function getRedemptions(userId: string): Promise<unknown> {
   );
 }
 
-function parseConfigResponse(json: unknown): RewardConfig {
+function parseConfigResponse(json: unknown): PlatformConfig {
   const raw =
     typeof json === "object" && json !== null
       ? ((json as Record<string, unknown>).data ?? json)
       : null;
 
   if (typeof raw !== "object" || raw === null) {
-    return DEFAULT_REWARD_CONFIG;
+    return DEFAULT_PLATFORM_CONFIG;
   }
 
   const obj = raw as Record<string, unknown>;
-  const pick = <K extends keyof RewardConfig>(
-    key: K,
-    fallback: RewardConfig[K],
-  ): RewardConfig[K] => {
+  const pickNum = (key: keyof PlatformConfig, fallback: number): number => {
     const value = obj[key];
-    return typeof value === typeof fallback ? (value as RewardConfig[K]) : fallback;
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  };
+  const pickStr = (key: keyof PlatformConfig, fallback: string): string => {
+    const value = obj[key];
+    return typeof value === "string" && value ? value : fallback;
   };
 
   return {
-    currency: pick("currency", DEFAULT_REWARD_CONFIG.currency),
-    symbol: pick("symbol", DEFAULT_REWARD_CONFIG.symbol),
-    tier2Amount: pick("tier2Amount", DEFAULT_REWARD_CONFIG.tier2Amount),
-    tier3Amount: pick("tier3Amount", DEFAULT_REWARD_CONFIG.tier3Amount),
-    minRedemption: pick("minRedemption", DEFAULT_REWARD_CONFIG.minRedemption),
-    minWaitSeconds: pick("minWaitSeconds", DEFAULT_REWARD_CONFIG.minWaitSeconds),
-    tier3Seconds: pick("tier3Seconds", DEFAULT_REWARD_CONFIG.tier3Seconds),
+    currency: pickStr("currency", DEFAULT_PLATFORM_CONFIG.currency),
+    symbol: pickStr("symbol", DEFAULT_PLATFORM_CONFIG.symbol),
+    minRedemption: pickNum(
+      "minRedemption",
+      DEFAULT_PLATFORM_CONFIG.minRedemption,
+    ),
+    minWaitSeconds: pickNum(
+      "minWaitSeconds",
+      DEFAULT_PLATFORM_CONFIG.minWaitSeconds,
+    ),
+    userRevenueShareBps: pickNum(
+      "userRevenueShareBps",
+      DEFAULT_PLATFORM_CONFIG.userRevenueShareBps,
+    ),
+    omniRevenueShareBps: pickNum(
+      "omniRevenueShareBps",
+      DEFAULT_PLATFORM_CONFIG.omniRevenueShareBps,
+    ),
   };
 }
 
-export async function getRewardConfig(): Promise<RewardConfig> {
-  if (cachedRewardConfig && Date.now() - configFetchedAt < CONFIG_TTL_MS) {
-    return cachedRewardConfig;
+export async function getPlatformConfig(): Promise<PlatformConfig> {
+  if (cachedPlatformConfig && Date.now() - configFetchedAt < CONFIG_TTL_MS) {
+    return cachedPlatformConfig;
   }
 
   try {
     const json = await requestJson<unknown>(`${API_BASE}/config`);
     const config = parseConfigResponse(json);
-    cachedRewardConfig = config;
+    cachedPlatformConfig = config;
     configFetchedAt = Date.now();
     return config;
   } catch {
-    return DEFAULT_REWARD_CONFIG;
+    return DEFAULT_PLATFORM_CONFIG;
   }
 }
 
@@ -317,14 +307,6 @@ function parseRedemptionsResponse(json: unknown): Redemption[] {
   throw new BackendError("Unexpected redemptions response shape");
 }
 
-function storageGetNumber(key: string): Promise<number> {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([key], (result) => {
-      resolve(Number(result[key] ?? 0));
-    });
-  });
-}
-
 function storageSet(values: Record<string, unknown>): Promise<void> {
   return new Promise((resolve) => {
     chrome.storage.local.set(values, () => resolve());
@@ -356,7 +338,11 @@ export async function ensureUserId(): Promise<string> {
 }
 
 async function updateStoredEarnings(amount: number): Promise<void> {
-  const current = await storageGetNumber(EARNINGS_KEY);
+  const current = await new Promise<number>((resolve) => {
+    chrome.storage.local.get([EARNINGS_KEY], (result) => {
+      resolve(Number(result[EARNINGS_KEY] ?? 0));
+    });
+  });
   const next = Math.round((current + amount) * 100) / 100;
   await storageSet({ [EARNINGS_KEY]: next });
 }
@@ -367,15 +353,6 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
   switch (message.type) {
     case "SESSION_START":
       return { ok: true, data: await startSession(userId) };
-
-    case "CLAIM_YIELD": {
-      const data = await claimYield({ ...message.payload, userId });
-      await updateStoredEarnings(message.payload.amount);
-      return { ok: true, data };
-    }
-
-    case "GET_SURVEY":
-      return { ok: true, data: await getSurveyNext(userId) };
 
     case "GET_AD":
       return { ok: true, data: await getAdNext() };
@@ -417,7 +394,11 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
       return { ok: true, data: await getHealth() };
 
     case "REDEEM": {
-      const data = await postRedeem(userId, message.payload.method, message.payload.detail);
+      const data = await postRedeem(
+        userId,
+        message.payload.method,
+        message.payload.detail,
+      );
       await storageSet({ [EARNINGS_KEY]: 0 });
       return { ok: true, data };
     }
@@ -431,7 +412,7 @@ async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
       };
 
     case "GET_CONFIG":
-      return { ok: true, data: await getRewardConfig() };
+      return { ok: true, data: await getPlatformConfig() };
   }
 }
 

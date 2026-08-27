@@ -3,21 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const STORAGE_KEYS = {
   earnings: "omniEarnings",
   userId: "omniUserId",
-  activeAiLayer: "activeAiLayer",
-  behavioralLayer: "behavioralLayer",
-  passiveDepinLayer: "passiveDepinLayer",
+  sponsoredWaitsEnabled: "sponsoredWaitsEnabled",
 } as const;
-
-type LayerKey =
-  | typeof STORAGE_KEYS.activeAiLayer
-  | typeof STORAGE_KEYS.behavioralLayer
-  | typeof STORAGE_KEYS.passiveDepinLayer;
-
-interface LayerToggle {
-  key: LayerKey;
-  label: string;
-  description: string;
-}
 
 interface Transaction {
   id: number;
@@ -60,73 +47,72 @@ type BackgroundResponse =
   | { ok: true; data: unknown; status?: number }
   | { ok: false; error: string; status?: number };
 
-const LAYER_LABELS: Record<string, string> = {
-  activeAiLayer: "Active AI Layer",
-  behavioralLayer: "Behavioral Layer",
-  passiveDepinLayer: "Passive DePIN Layer",
-};
-
-type RewardConfig = {
+type PlatformConfig = {
   currency: string;
   symbol: string;
-  tier2Amount: number;
-  tier3Amount: number;
   minRedemption: number;
   minWaitSeconds: number;
-  tier3Seconds: number;
+  userRevenueShareBps: number;
+  omniRevenueShareBps: number;
 };
 
-const FALLBACK_REWARD_CONFIG: RewardConfig = {
+const FALLBACK_PLATFORM_CONFIG: PlatformConfig = {
   currency: "INR",
   symbol: "₹",
-  tier2Amount: 2,
-  tier3Amount: 10,
   minRedemption: 100,
   minWaitSeconds: 5,
-  tier3Seconds: 15,
+  userRevenueShareBps: 6000,
+  omniRevenueShareBps: 4000,
 };
+
+const SUPPORTED_PLATFORMS = [
+  "ChatGPT",
+  "Claude",
+  "Gemini",
+  "Perplexity",
+  "Copilot",
+  "DeepSeek",
+  "Grok",
+  "Meta AI",
+  "Mistral",
+  "Poe",
+];
 
 function formatMoney(symbol: string, value: number): string {
   const display = value % 1 === 0 ? String(value) : value.toFixed(2);
   return `${symbol}${display}`;
 }
 
-const LAYERS: LayerToggle[] = [
-  {
-    key: STORAGE_KEYS.activeAiLayer,
-    label: "Active AI Layer",
-    description: "Earn while your AI models are generating responses.",
-  },
-  {
-    key: STORAGE_KEYS.behavioralLayer,
-    label: "Behavioral Layer",
-    description: "Capture mindful wait-time signals from chat sessions.",
-  },
-  {
-    key: STORAGE_KEYS.passiveDepinLayer,
-    label: "Passive DePIN Layer",
-    description: "Background network participation for passive yield.",
-  },
-];
-
-function parseRewardConfig(data: unknown): RewardConfig {
-  if (typeof data !== "object" || data === null) return FALLBACK_REWARD_CONFIG;
+function parsePlatformConfig(data: unknown): PlatformConfig {
+  if (typeof data !== "object" || data === null) return FALLBACK_PLATFORM_CONFIG;
   const obj = data as Record<string, unknown>;
-  const pick = <K extends keyof RewardConfig>(
-    key: K,
-    fallback: RewardConfig[K],
-  ): RewardConfig[K] => {
+  const pickNum = (key: keyof PlatformConfig, fallback: number): number => {
     const value = obj[key];
-    return typeof value === typeof fallback ? (value as RewardConfig[K]) : fallback;
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  };
+  const pickStr = (key: keyof PlatformConfig, fallback: string): string => {
+    const value = obj[key];
+    return typeof value === "string" && value ? value : fallback;
   };
   return {
-    currency: pick("currency", FALLBACK_REWARD_CONFIG.currency),
-    symbol: pick("symbol", FALLBACK_REWARD_CONFIG.symbol),
-    tier2Amount: pick("tier2Amount", FALLBACK_REWARD_CONFIG.tier2Amount),
-    tier3Amount: pick("tier3Amount", FALLBACK_REWARD_CONFIG.tier3Amount),
-    minRedemption: pick("minRedemption", FALLBACK_REWARD_CONFIG.minRedemption),
-    minWaitSeconds: pick("minWaitSeconds", FALLBACK_REWARD_CONFIG.minWaitSeconds),
-    tier3Seconds: pick("tier3Seconds", FALLBACK_REWARD_CONFIG.tier3Seconds),
+    currency: pickStr("currency", FALLBACK_PLATFORM_CONFIG.currency),
+    symbol: pickStr("symbol", FALLBACK_PLATFORM_CONFIG.symbol),
+    minRedemption: pickNum(
+      "minRedemption",
+      FALLBACK_PLATFORM_CONFIG.minRedemption,
+    ),
+    minWaitSeconds: pickNum(
+      "minWaitSeconds",
+      FALLBACK_PLATFORM_CONFIG.minWaitSeconds,
+    ),
+    userRevenueShareBps: pickNum(
+      "userRevenueShareBps",
+      FALLBACK_PLATFORM_CONFIG.userRevenueShareBps,
+    ),
+    omniRevenueShareBps: pickNum(
+      "omniRevenueShareBps",
+      FALLBACK_PLATFORM_CONFIG.omniRevenueShareBps,
+    ),
   };
 }
 
@@ -147,21 +133,26 @@ function formatRelativeTime(createdAt: string): string {
   return `${diffDay}d ago`;
 }
 
-function sendBackgroundMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
+function sendBackgroundMessage(
+  message: BackgroundMessage,
+): Promise<BackgroundResponse> {
   return new Promise((resolve, reject) => {
     try {
-      chrome.runtime.sendMessage(message, (response: BackgroundResponse | undefined) => {
-        const runtimeError = chrome.runtime.lastError;
-        if (runtimeError) {
-          reject(new Error(runtimeError.message));
-          return;
-        }
-        if (!response) {
-          reject(new Error("No background response"));
-          return;
-        }
-        resolve(response);
-      });
+      chrome.runtime.sendMessage(
+        message,
+        (response: BackgroundResponse | undefined) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+          if (!response) {
+            reject(new Error("No background response"));
+            return;
+          }
+          resolve(response);
+        },
+      );
     } catch (error) {
       reject(error);
     }
@@ -230,11 +221,7 @@ function ToggleSwitch({
 export default function App() {
   const [earnings, setEarnings] = useState(0);
   const [balanceSource, setBalanceSource] = useState<"api" | "local">("local");
-  const [layers, setLayers] = useState<Record<LayerKey, boolean>>({
-    [STORAGE_KEYS.activeAiLayer]: true,
-    [STORAGE_KEYS.behavioralLayer]: false,
-    [STORAGE_KEYS.passiveDepinLayer]: false,
-  });
+  const [sponsoredWaitsEnabled, setSponsoredWaitsEnabled] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [transactionsLoading, setTransactionsLoading] = useState(true);
@@ -248,8 +235,10 @@ export default function App() {
   const [redeemSubmitting, setRedeemSubmitting] = useState(false);
   const [redeemSuccess, setRedeemSuccess] = useState(false);
   const [redeemError, setRedeemError] = useState<string | null>(null);
-  const [rewardConfig, setRewardConfig] = useState<RewardConfig>(FALLBACK_REWARD_CONFIG);
-  const [showRewardsInfo, setShowRewardsInfo] = useState(false);
+  const [platformConfig, setPlatformConfig] = useState<PlatformConfig>(
+    FALLBACK_PLATFORM_CONFIG,
+  );
+  const [showInfo, setShowInfo] = useState(false);
   const balanceSourceRef = useRef(balanceSource);
   balanceSourceRef.current = balanceSource;
 
@@ -258,25 +247,25 @@ export default function App() {
       [
         STORAGE_KEYS.earnings,
         STORAGE_KEYS.userId,
-        STORAGE_KEYS.activeAiLayer,
-        STORAGE_KEYS.behavioralLayer,
-        STORAGE_KEYS.passiveDepinLayer,
+        STORAGE_KEYS.sponsoredWaitsEnabled,
+        "behavioralLayer",
       ],
       (result) => {
         setEarnings(Number(result[STORAGE_KEYS.earnings] ?? 0));
         const userId = result[STORAGE_KEYS.userId];
         setUserIdPrefix(typeof userId === "string" ? userId.slice(0, 8) : null);
-        setLayers({
-          [STORAGE_KEYS.activeAiLayer]: Boolean(
-            result[STORAGE_KEYS.activeAiLayer] ?? true,
-          ),
-          [STORAGE_KEYS.behavioralLayer]: Boolean(
-            result[STORAGE_KEYS.behavioralLayer] ?? false,
-          ),
-          [STORAGE_KEYS.passiveDepinLayer]: Boolean(
-            result[STORAGE_KEYS.passiveDepinLayer] ?? false,
-          ),
-        });
+        if (
+          Object.prototype.hasOwnProperty.call(
+            result,
+            STORAGE_KEYS.sponsoredWaitsEnabled,
+          )
+        ) {
+          setSponsoredWaitsEnabled(
+            result[STORAGE_KEYS.sponsoredWaitsEnabled] !== false,
+          );
+        } else {
+          setSponsoredWaitsEnabled(result.behavioralLayer !== false);
+        }
         setLoaded(true);
       },
     );
@@ -289,7 +278,7 @@ export default function App() {
       try {
         const configResponse = await sendBackgroundMessage({ type: "GET_CONFIG" });
         if (configResponse.ok) {
-          setRewardConfig(parseRewardConfig(configResponse.data));
+          setPlatformConfig(parsePlatformConfig(configResponse.data));
         }
       } catch {
         // keep fallback config
@@ -334,7 +323,9 @@ export default function App() {
       }
 
       try {
-        const redemptionsResponse = await sendBackgroundMessage({ type: "GET_REDEMPTIONS" });
+        const redemptionsResponse = await sendBackgroundMessage({
+          type: "GET_REDEMPTIONS",
+        });
         if (redemptionsResponse.ok) {
           setRedemptions(parseRedemptionsData(redemptionsResponse.data));
         }
@@ -358,25 +349,20 @@ export default function App() {
         setUserIdPrefix(typeof nextId === "string" ? nextId.slice(0, 8) : null);
       }
 
-      setLayers((prev) => {
-        const next = { ...prev };
-        for (const key of Object.values(STORAGE_KEYS)) {
-          if (key === STORAGE_KEYS.earnings || key === STORAGE_KEYS.userId) continue;
-          if (changes[key]) {
-            next[key as LayerKey] = Boolean(changes[key].newValue);
-          }
-        }
-        return next;
-      });
+      if (changes[STORAGE_KEYS.sponsoredWaitsEnabled]) {
+        setSponsoredWaitsEnabled(
+          changes[STORAGE_KEYS.sponsoredWaitsEnabled].newValue !== false,
+        );
+      }
     };
 
     chrome.storage.onChanged.addListener(onStorageChange);
     return () => chrome.storage.onChanged.removeListener(onStorageChange);
   }, []);
 
-  const handleLayerToggle = useCallback((key: LayerKey, next: boolean) => {
-    setLayers((prev) => ({ ...prev, [key]: next }));
-    chrome.storage.local.set({ [key]: next });
+  const handleSponsoredToggle = useCallback((next: boolean) => {
+    setSponsoredWaitsEnabled(next);
+    chrome.storage.local.set({ [STORAGE_KEYS.sponsoredWaitsEnabled]: next });
   }, []);
 
   const pendingRedemption = redemptions.find((r) => r.status === "pending");
@@ -420,6 +406,8 @@ export default function App() {
   const methodLabel = (method: string) =>
     method === "amazon_voucher" ? "Amazon Pay voucher" : "UPI";
 
+  const userPct = Math.floor(platformConfig.userRevenueShareBps / 100);
+
   return (
     <div className="min-h-[420px] bg-omni-bg p-5 text-white">
       <header className="mb-6">
@@ -429,7 +417,7 @@ export default function App() {
               OmniPiggy
             </p>
             <h1 className="mt-1 text-lg font-semibold text-white">
-              Personal AI Dividend
+              AI Wait-Time Earnings
             </h1>
           </div>
           {bankOnline !== null && (
@@ -440,16 +428,16 @@ export default function App() {
                 }`}
               />
               <span className="text-[10px] text-zinc-400">
-                {bankOnline ? "Bank online" : "Bank offline"}
+                {bankOnline ? "API online" : "API offline"}
               </span>
             </div>
           )}
         </div>
       </header>
 
-      <section className="mb-8 rounded-2xl border border-omni-border bg-omni-surface p-5">
+      <section className="mb-6 rounded-2xl border border-omni-border bg-omni-surface p-5">
         <p className="text-xs font-medium uppercase tracking-wider text-zinc-400">
-          Wallet Balance
+          Total Earned
         </p>
         <p
           className={`mt-2 text-4xl font-bold tabular-nums text-omni-neon ${
@@ -457,18 +445,19 @@ export default function App() {
           }`}
           style={{ textShadow: "0 0 16px rgba(57, 255, 136, 0.45)" }}
         >
-          {formatMoney(rewardConfig.symbol, earnings)}
+          {formatMoney(platformConfig.symbol, earnings)}
         </p>
         <p className="mt-2 text-xs text-zinc-500">
           {balanceSource === "api"
-            ? "Live balance from Omni Bank"
-            : "Live balance synced from chrome.storage.local"}
+            ? "Live wallet from Omni ledger"
+            : "Cached balance from local storage"}
         </p>
 
         {pendingRedemption ? (
           <div className="mt-4 rounded-lg border border-omni-border bg-omni-bg px-3 py-2.5">
             <p className="text-xs font-medium text-amber-400">
-              Redemption pending — {formatMoney(rewardConfig.symbol, pendingRedemption.amount)} via{" "}
+              Redemption pending —{" "}
+              {formatMoney(platformConfig.symbol, pendingRedemption.amount)} via{" "}
               {methodLabel(pendingRedemption.method)}
             </p>
             <p className="mt-1 text-[11px] text-zinc-500">
@@ -479,7 +468,7 @@ export default function App() {
           <p className="mt-4 text-xs text-omni-neon">
             Redemption requested — we&apos;ll process it within a few days.
           </p>
-        ) : earnings >= rewardConfig.minRedemption ? (
+        ) : earnings >= platformConfig.minRedemption ? (
           <div className="mt-4">
             {!showRedeemForm ? (
               <button
@@ -557,31 +546,36 @@ export default function App() {
           </div>
         ) : (
           <p className="mt-3 text-[11px] text-zinc-600">
-            Redeem from {formatMoney(rewardConfig.symbol, rewardConfig.minRedemption)}
+            Redeem from{" "}
+            {formatMoney(platformConfig.symbol, platformConfig.minRedemption)}
           </p>
         )}
       </section>
 
-      <section className="mb-8">
+      <section className="mb-6">
         <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-          Protocol Layers
+          Sponsored Waits
         </h2>
-        <div className="space-y-2">
-          {LAYERS.map((layer) => (
-            <ToggleSwitch
-              key={layer.key}
-              enabled={layers[layer.key]}
-              label={layer.label}
-              description={layer.description}
-              onChange={(next) => handleLayerToggle(layer.key, next)}
-            />
-          ))}
-        </div>
+        <ToggleSwitch
+          enabled={sponsoredWaitsEnabled}
+          label="Sponsored Waits"
+          description="Show sponsored content while supported AI services generate responses."
+          onChange={handleSponsoredToggle}
+        />
+      </section>
+
+      <section className="mb-6">
+        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+          Supported Platforms
+        </h2>
+        <p className="text-xs leading-relaxed text-zinc-400">
+          {SUPPORTED_PLATFORMS.join(" · ")}
+        </p>
       </section>
 
       <section>
         <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-          Recent Activity
+          Recent Earnings
         </h2>
         <div className="max-h-40 overflow-y-auto rounded-xl border border-omni-border bg-omni-surface">
           {transactionsLoading ? (
@@ -590,11 +584,11 @@ export default function App() {
             </p>
           ) : transactionsOffline ? (
             <p className="px-4 py-6 text-center text-xs text-zinc-500">
-              Bank offline
+              API offline
             </p>
           ) : transactions.length === 0 ? (
             <p className="px-4 py-6 text-center text-xs text-zinc-500">
-              No dividends claimed yet
+              No settled sponsored earnings yet
             </p>
           ) : (
             <ul className="divide-y divide-omni-border">
@@ -604,11 +598,11 @@ export default function App() {
                   className="flex items-center justify-between gap-3 px-4 py-2.5"
                 >
                   <span className="min-w-0 truncate text-xs text-zinc-300">
-                    {LAYER_LABELS[tx.layer] ?? tx.layer}
+                    Sponsored Wait
                   </span>
                   <div className="flex shrink-0 items-center gap-3">
                     <span className="text-xs font-semibold tabular-nums text-omni-neon">
-                      +{formatMoney(rewardConfig.symbol, tx.amount)}
+                      +{formatMoney(platformConfig.symbol, tx.amount)}
                     </span>
                     <span className="text-[10px] text-zinc-500">
                       {formatRelativeTime(tx.created_at)}
@@ -624,36 +618,24 @@ export default function App() {
       <footer className="mt-6 border-t border-omni-border pt-3 text-center">
         <button
           type="button"
-          onClick={() => setShowRewardsInfo((open) => !open)}
+          onClick={() => setShowInfo((open) => !open)}
           className="text-[10px] text-zinc-500 underline decoration-zinc-700 underline-offset-2 hover:text-zinc-400"
         >
-          How rewards work
+          How earnings work
         </button>
-        {showRewardsInfo && (
+        {showInfo && (
           <p className="mt-2 px-1 text-left text-[10px] leading-relaxed text-zinc-500">
-            While your AI is thinking, OmniPiggy offers small rewards: claim{" "}
-            {formatMoney(rewardConfig.symbol, rewardConfig.tier2Amount)} after{" "}
-            {rewardConfig.minWaitSeconds} seconds, or answer one quick question after{" "}
-            {rewardConfig.tier3Seconds} seconds to earn{" "}
-            {formatMoney(rewardConfig.symbol, rewardConfig.tier3Amount)}. Credits are
-            experimental during our early release. Once your balance reaches{" "}
-            {formatMoney(rewardConfig.symbol, rewardConfig.minRedemption)} you can request a
-            redemption (Amazon Pay voucher or UPI), which we currently process manually
-            within a few days. OmniPiggy never reads your conversations — it only detects
-            when the AI is loading.
+            Omni shows sponsored content while supported AI services generate
+            responses. When an advertiser-funded wait qualifies, {userPct}% of
+            that qualifying ad revenue is added to your wallet. There is no
+            claim button and no fixed reward. Omni never reads your
+            conversations — it only detects when the AI is loading. Redeem from{" "}
+            {formatMoney(platformConfig.symbol, platformConfig.minRedemption)}{" "}
+            via Amazon Pay voucher or UPI.
           </p>
         )}
         <p className="mt-2 text-[10px] font-mono tracking-wide text-zinc-600">
           ID: {userIdPrefix ?? "…"}
-          <span className="mx-1.5 text-zinc-700">·</span>
-          <a
-            href="https://omni-protocol-ai-waittime-production.up.railway.app/privacy"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-zinc-500 underline decoration-zinc-700 underline-offset-2 hover:text-zinc-400"
-          >
-            Privacy Policy
-          </a>
         </p>
       </footer>
     </div>

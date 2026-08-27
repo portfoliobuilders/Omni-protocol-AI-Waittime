@@ -1,18 +1,21 @@
-const DEFAULT_API_BASE =
-  "https://omni-protocol-ai-waittime-production.up.railway.app";
-const BOX_ID = "omni-b2b-card";
+/**
+ * Omni Monetize B2B SDK (Phase 1 cleanup).
+ * Fixed-reward claim UX removed. Partners start wait sessions and show a
+ * Sponsored Wait card; advertiser settlement arrives in later phases.
+ */
+const DEFAULT_API_BASE = "http://localhost:3001";
+const BOX_ID = "omni-wait-ad";
 const STYLE_ID = "omni-b2b-styles";
-const LAYER = "behavioralLayer";
-const MIN_WAIT_SECONDS = 5;
 
-type RewardConfig = {
+type PlatformConfig = {
   symbol: string;
-  tier2Amount: number;
   minWaitSeconds: number;
+  userRevenueShareBps: number;
 };
 
 type OmniInitOptions = {
   partnerKey: string;
+  /** Required for non-local deployments. Defaults to http://localhost:3001 */
   apiBase?: string;
   userId?: string;
 };
@@ -29,17 +32,15 @@ let config: {
   userId: string;
 } | null = null;
 
-let rewardConfig: RewardConfig = {
+let platformConfig: PlatformConfig = {
   symbol: "₹",
-  tier2Amount: 2,
-  minWaitSeconds: MIN_WAIT_SECONDS,
+  minWaitSeconds: 5,
+  userRevenueShareBps: 6000,
 };
 
 let sessionToken: string | null = null;
 let generationStartedAt: number | null = null;
 let waitTimerInterval: ReturnType<typeof setInterval> | null = null;
-let claimedThisCycle = false;
-let isClaiming = false;
 
 function getStoredUserId(): string {
   const key = "omni_b2b_user_id";
@@ -62,17 +63,19 @@ async function fetchConfig(apiBase: string): Promise<void> {
 
     const json = (await response.json()) as {
       success?: boolean;
-      data?: Partial<RewardConfig>;
+      data?: Partial<PlatformConfig>;
     };
 
     if (!json.success || !json.data) {
       return;
     }
 
-    rewardConfig = {
-      symbol: json.data.symbol ?? rewardConfig.symbol,
-      tier2Amount: json.data.tier2Amount ?? rewardConfig.tier2Amount,
-      minWaitSeconds: json.data.minWaitSeconds ?? rewardConfig.minWaitSeconds,
+    platformConfig = {
+      symbol: json.data.symbol ?? platformConfig.symbol,
+      minWaitSeconds:
+        json.data.minWaitSeconds ?? platformConfig.minWaitSeconds,
+      userRevenueShareBps:
+        json.data.userRevenueShareBps ?? platformConfig.userRevenueShareBps,
     };
   } catch {
     // Keep defaults when config is unreachable.
@@ -85,10 +88,6 @@ function getElapsedSeconds(): number {
   }
 
   return Math.floor((Date.now() - generationStartedAt) / 1000);
-}
-
-function formatMoney(amount: number): string {
-  return `${rewardConfig.symbol}${amount}`;
 }
 
 function injectStyles(): void {
@@ -118,48 +117,31 @@ function injectStyles(): void {
     }
 
     #${BOX_ID} .omni-title {
-      margin: 0 0 14px;
-      font-size: 17px;
+      margin: 0 0 8px;
+      font-size: 15px;
       font-weight: 600;
       color: #ffffff;
     }
 
     #${BOX_ID} .omni-body {
-      margin: 0 0 10px;
-      font-size: 14px;
+      margin: 0 0 8px;
+      font-size: 13px;
       line-height: 1.45;
       color: #a1a1aa;
     }
 
     #${BOX_ID} .omni-counter {
-      margin: 0 0 14px;
+      margin: 0 0 8px;
       font-size: 12px;
       font-weight: 500;
       letter-spacing: 0.05em;
       color: #71717a;
     }
 
-    #${BOX_ID} .omni-claim-btn {
-      width: 100%;
-      padding: 11px 16px;
-      border: none;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #39ff88 0%, #1a9f52 100%);
-      color: #0a1a10;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-
-    #${BOX_ID} .omni-claim-btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    #${BOX_ID} .omni-success {
+    #${BOX_ID} .omni-share-note {
       margin: 0;
-      font-size: 14px;
-      color: #39ff88;
+      font-size: 11px;
+      color: #71717a;
     }
   `;
   document.head.appendChild(style);
@@ -167,40 +149,37 @@ function injectStyles(): void {
 
 function removeCard(): void {
   document.getElementById(BOX_ID)?.remove();
+  document.getElementById("omni-b2b-card")?.remove();
 }
 
 function updateCard(): void {
   const box = document.getElementById(BOX_ID);
-  if (!box || claimedThisCycle || isClaiming) {
+  if (!box) {
     return;
   }
 
   const title = box.querySelector<HTMLElement>(".omni-title");
   const body = box.querySelector<HTMLElement>(".omni-body");
   const counter = box.querySelector<HTMLElement>(".omni-counter");
-  const button = box.querySelector<HTMLButtonElement>(".omni-claim-btn");
-  if (!title || !body || !counter || !button) {
+  const shareNote = box.querySelector<HTMLElement>(".omni-share-note");
+  if (!title || !body || !counter || !shareNote) {
     return;
   }
 
   const elapsed = getElapsedSeconds();
-  const ready = elapsed >= rewardConfig.minWaitSeconds;
+  const userPct = Math.floor(platformConfig.userRevenueShareBps / 100);
+  title.textContent = "Sponsored Wait";
+  shareNote.textContent = `Omni · Partner inventory · ${userPct}% user share model`;
 
-  if (!ready) {
-    title.textContent = "🧘 Mindful Break";
-    body.textContent = "Your AI is thinking — take a breath.";
-    body.hidden = false;
+  if (elapsed < platformConfig.minWaitSeconds) {
+    body.textContent = "Loading sponsored placement while AI generates…";
     counter.textContent = `${elapsed}s`;
     counter.hidden = false;
-    button.hidden = true;
-    return;
+  } else {
+    body.textContent =
+      "Wait qualified for inventory. Settlement uses advertiser-funded revenue (no fixed claim).";
+    counter.hidden = true;
   }
-
-  body.hidden = true;
-  counter.hidden = true;
-  button.hidden = false;
-  title.textContent = "🧘 Mindful Break";
-  button.textContent = `Claim ${formatMoney(rewardConfig.tier2Amount)} Dividend`;
 }
 
 function showCard(): void {
@@ -223,15 +202,10 @@ function showCard(): void {
   const counter = document.createElement("p");
   counter.className = "omni-counter";
 
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "omni-claim-btn";
-  button.hidden = true;
-  button.addEventListener("click", () => {
-    void handleClaim(box, button);
-  });
+  const shareNote = document.createElement("p");
+  shareNote.className = "omni-share-note";
 
-  box.append(title, body, counter, button);
+  box.append(title, body, counter, shareNote);
   document.body.appendChild(box);
   updateCard();
 }
@@ -242,7 +216,7 @@ function startWaitTimer(): void {
   }
 
   waitTimerInterval = setInterval(() => {
-    if (!generationStartedAt || claimedThisCycle) {
+    if (!generationStartedAt) {
       return;
     }
 
@@ -254,65 +228,6 @@ function stopWaitTimer(): void {
   if (waitTimerInterval !== null) {
     clearInterval(waitTimerInterval);
     waitTimerInterval = null;
-  }
-}
-
-async function handleClaim(
-  box: HTMLElement,
-  button: HTMLButtonElement,
-): Promise<void> {
-  if (!config || !sessionToken || isClaiming || claimedThisCycle) {
-    return;
-  }
-
-  if (getElapsedSeconds() < rewardConfig.minWaitSeconds) {
-    return;
-  }
-
-  isClaiming = true;
-  button.disabled = true;
-
-  try {
-    const response = await fetch(`${config.apiBase}/api/v1/yield`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        userId: config.userId,
-        amount: rewardConfig.tier2Amount,
-        layer: LAYER,
-        nonce: crypto.randomUUID(),
-        sessionToken,
-        partnerKey: config.partnerKey,
-      }),
-    });
-
-    const json = (await response.json()) as {
-      success?: boolean;
-      message?: string;
-      data?: { creditedAmount?: number };
-    };
-
-    if (!response.ok || !json.success) {
-      throw new Error(json.message ?? `Claim failed (${response.status})`);
-    }
-
-    claimedThisCycle = true;
-    stopWaitTimer();
-
-    const credited = json.data?.creditedAmount ?? rewardConfig.tier2Amount;
-    box.replaceChildren();
-    const success = document.createElement("p");
-    success.className = "omni-success";
-    success.textContent = `Claimed ${formatMoney(credited)}!`;
-    box.append(success);
-
-    window.setTimeout(() => {
-      removeCard();
-    }, 2500);
-  } catch (error) {
-    button.disabled = false;
-    isClaiming = false;
-    console.error("[Omni SDK] Claim failed:", error);
   }
 }
 
@@ -336,8 +251,6 @@ async function onGenerationStart(): Promise<void> {
     throw new Error("Call Omni.init() before Omni.onGenerationStart().");
   }
 
-  claimedThisCycle = false;
-  isClaiming = false;
   generationStartedAt = Date.now();
   sessionToken = null;
   removeCard();
@@ -369,10 +282,8 @@ async function onGenerationStart(): Promise<void> {
 function onGenerationEnd(): void {
   generationStartedAt = null;
   stopWaitTimer();
-
-  if (!claimedThisCycle) {
-    removeCard();
-  }
+  removeCard();
+  sessionToken = null;
 }
 
 const Omni: OmniGlobal = {

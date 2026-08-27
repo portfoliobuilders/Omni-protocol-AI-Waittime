@@ -1,0 +1,14 @@
+{
+  "name": "@omni-piggy/money",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Integer micropaise money utilities for OmniPiggy",
+  "type": "module",
+  "main": "./micropaise.ts",
+  "exports": {
+    ".": "./micropaise.ts"
+  },
+  "scripts": {
+    "test": "tsx ./micropaise.test.ts"
+  }
+}

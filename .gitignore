@@ -2,9 +2,14 @@ node_modules/
 client-extension/dist/
 backend-core/dist/
 b2b-sdk/dist/
-omni-ledger.db
-omni-ledger.db-shm
-omni-ledger.db-wal
+*.db
+*.db-shm
+*.db-wal
+backend-core/data/
+*.zip
 .env
 .env.*
+!.env.example
+.supabase/
+.cursor/
 .DS_Store

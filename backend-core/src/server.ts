@@ -55,14 +55,26 @@ import {
 
 dotenv.config();
 
-// Single source of truth for reward economics (INR).
+/**
+ * Platform economics (INR display + share config).
+ * Fixed ₹2/₹10 claim rewards are DEPRECATED — kept only so legacy /yield
+ * smoke paths still function until Phase 2 settlement replaces them.
+ * Clients must not treat tier*Amount as product UX.
+ */
 const REWARD_ECONOMICS = {
   currency: "INR",
   symbol: "₹",
-  tier2Amount: 2,
-  tier3Amount: 10,
   minRedemption: 100,
   minWaitSeconds: 5,
+  /** Basis points: 6000 = 60% user share of qualifying advertiser revenue. */
+  userRevenueShareBps: 6000,
+  /** Basis points: 4000 = 40% Omni share. */
+  omniRevenueShareBps: 4000,
+  /** @deprecated Phase 1 — do not surface in product UI. */
+  tier2Amount: 2,
+  /** @deprecated Phase 1 — do not surface in product UI. */
+  tier3Amount: 10,
+  /** @deprecated Phase 1 — do not surface in product UI. */
   tier3Seconds: 15,
   /** Campaign impression revenue split (percent). Enforced server-side in paise. */
   revenueShare: {
@@ -570,25 +582,25 @@ app.get("/privacy", (_req: Request, res: Response) => {
   <main>
     <h1>OmniPiggy Privacy Policy</h1>
     <p class="effective">Effective date: July 3, 2026</p>
-    <p>OmniPiggy is a browser extension that rewards you during AI wait time. This policy explains what we collect and what we do not.</p>
+    <p>OmniPiggy is a browser extension that shares advertiser-funded revenue during verified AI wait time. This policy explains what we collect and what we do not.</p>
 
     <h2>What we collect</h2>
     <ul>
       <li>A random anonymous install ID generated on your device (stored locally and sent with API requests).</li>
-      <li>Claim transactions (amount, layer, timestamp, and a unique nonce to prevent duplicates).</li>
-      <li>Survey answers you choose to submit during wait-time prompts.</li>
-      <li>Ad impression and click counts when you interact with optional ads.</li>
+      <li>Wait-session and settlement records (timestamps, unique nonces) to prevent duplicate earnings.</li>
+      <li>Ad impression and click counts when you interact with sponsored content.</li>
+      <li>Redemption requests you submit (method and payout detail you provide).</li>
     </ul>
 
     <h2>What we do not collect</h2>
     <ul>
-      <li>Your name, email address, or other personal identity information.</li>
+      <li>Your name, email address, or other personal identity information (unless you provide it for redemption).</li>
       <li>Your browsing history outside supported AI chat pages.</li>
-      <li>Any content of your AI conversations. The extension only detects loading states on ChatGPT and Claude — it never reads your chats.</li>
+      <li>Any content of your AI conversations. The extension only detects loading states on supported AI sites — it never reads your chats for advertising.</li>
     </ul>
 
     <h2>Where data lives</h2>
-    <p>Data is stored on our server (hosted on Railway). It is used to track your wallet balance, prevent duplicate claims, and improve the service.</p>
+    <p>Data is stored on our server (Supabase / self-hosted API — see your OMNI_API_BASE). It is used to track your wallet balance, prevent duplicate settlements, and improve the service. We do not read your AI prompts or answers for advertising.</p>
 
     <h2>Your rights</h2>
     <p>You may contact us to request deletion of your data. Uninstalling the extension stops all further collection from your browser.</p>

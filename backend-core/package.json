@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "smoke": "tsx scripts/smoke-test.ts"
+    "smoke": "tsx scripts/smoke-test.ts",
+    "test:money": "tsx ../shared/money/micropaise.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

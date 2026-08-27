@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Omni B2B SDK Demo</title>
+  <title>Omni Monetize SDK Demo</title>
   <style>
     :root {
       color-scheme: dark;
@@ -86,11 +86,11 @@
 </head>
 <body>
   <main>
-    <h1>Omni B2B SDK Demo</h1>
+    <h1>Omni Monetize SDK Demo</h1>
     <p>
       Paste your partner <code>pk_</code> key from the admin dashboard, then click
-      the fake-AI button. After 5 seconds the Omni card appears bottom-right —
-      claim ₹2 and verify the transaction under your partner in the dashboard.
+      the fake-AI button. A Sponsored Wait card appears — there is no fixed ₹ claim.
+      Point <code>apiBase</code> at your local or deployed Omni API.
     </p>
 
     <label for="partnerKey">Partner key</label>
@@ -106,9 +106,9 @@
     <p class="status" id="status">Paste a partner key to begin.</p>
   </main>
 
-  <!-- Production SDK (served by backend): -->
-  <script src="https://omni-protocol-ai-waittime-production.up.railway.app/sdk/omni.min.js"></script>
-  <!-- Local alternative: <script src="../dist/omni.min.js"></script> -->
+  <!-- Local SDK build: -->
+  <script src="../dist/omni.min.js"></script>
+  <!-- Or serve from your API host: /sdk/omni.min.js -->
 
   <script>
     const partnerKeyInput = document.getElementById("partnerKey");
@@ -128,7 +128,7 @@
 
       Omni.init({
         partnerKey: partnerKey,
-        apiBase: "https://omni-protocol-ai-waittime-production.up.railway.app",
+        apiBase: "http://localhost:3001",
       });
 
       return partnerKey;
@@ -141,7 +141,7 @@
       try {
         ensureInitialized();
         await Omni.onGenerationStart();
-        setStatus("AI is thinking... Omni card will unlock the claim in 5s.");
+        setStatus("AI is thinking... Sponsored Wait card is visible.");
 
         if (fakeGenerationTimer) {
           clearTimeout(fakeGenerationTimer);
@@ -149,11 +149,11 @@
 
         fakeGenerationTimer = setTimeout(function () {
           Omni.onGenerationEnd();
-          setStatus("Generation finished. Claim your dividend from the card.");
+          setStatus("Generation ended. Card dismissed.");
           fakeAiBtn.disabled = false;
-        }, 8000);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Failed to start session.");
+        }, 5000);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : "Demo failed.");
         fakeAiBtn.disabled = false;
       }
     });

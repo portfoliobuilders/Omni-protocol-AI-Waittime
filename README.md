@@ -1,10 +1,50 @@
-# OmniPiggy
+# OmniPiggy / Omni Protocol
 
 [![CI](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml/badge.svg)](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml)
 
-OmniPiggy is a Chrome extension that detects AI generation wait time on claude.ai and chatgpt.com, shows a "Mindful Break" box, and lets the user claim micro-dividends that are credited to a persistent SQLite ledger via a local Node.js backend.
+OmniPiggy is a Chrome extension that detects genuine AI generation wait time on supported AI sites, shows a **Sponsored Wait**, and (in later phases) settles advertiser-funded revenue **60% user / 40% Omni**.
 
-## Run the backend
+There is **no fixed ₹2/₹10 reward**, **no claim button**, and **no Mindful Break / breathing UX**.
+
+## Product map
+
+| Product | Role |
+|---------|------|
+| **OmniPiggy** | Consumer Chrome / AI extension |
+| **Omni Ads** | Advertiser platform |
+| **Omni Monetize** | Publisher / developer SDK |
+| **Omni Exchange** | Auction, settlement, attribution (Supabase-backed) |
+
+## Phase 1 status
+
+- Supabase foundation schema + RLS live under `supabase/`
+- Integer **micropaise** accounting utilities under `shared/money/`
+- Railway production URLs removed from extension / SDK defaults
+- Legacy SQLite Express backend remains for local CI + historical migration only
+
+## Environment
+
+Copy `.env.example` — placeholders only:
+
+```bash
+SUPABASE_URL=
+SUPABASE_PUBLISHABLE_KEY=
+OMNI_API_BASE=http://localhost:3001
+```
+
+Never put service-role keys in the extension.
+
+### Supabase CLI (you run these — credentials are yours)
+
+```bash
+supabase login
+supabase link --project-ref <PROJECT_REF>
+supabase db push
+```
+
+See `supabase/README.md`.
+
+## Run the legacy local backend (SQLite — migration bridge)
 
 ```bash
 cd backend-core
@@ -12,7 +52,7 @@ npm install
 npm run dev
 ```
 
-The server listens on **http://localhost:3001**. The ledger persists to `omni-ledger.db`.
+Listens on **http://localhost:3001**. Ledger file: `omni-ledger.db` (not production destination).
 
 ## Build & load the extension
 
@@ -25,42 +65,55 @@ npm run build
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
 3. Click **Load unpacked**
-4. Select the `client-extension/dist` folder
+4. Select `client-extension/dist`
 
-**IMPORTANT:** After every extension reload, refresh any open claude.ai/chatgpt.com tabs.
+**IMPORTANT:** After every extension reload, refresh every open AI tab.
 
-## API endpoints
-
-| Method | Path | Notes |
-|--------|------|-------|
-| `GET` | `/health` | Liveness check |
-| `POST` | `/api/v1/yield` | Body: `userId`, `amount`, `layer`, `nonce` — nonce must be unique per claim; duplicates return 200 with `duplicate: true` |
-| `GET` | `/api/v1/balance/:userId` | Returns the user's current balance |
-| `GET` | `/api/v1/transactions/:userId?limit=N` | Returns recent transactions (default limit 25, max 100) |
-
-## Troubleshooting
-
-- **Port 3001 in use** — Run `taskkill /F /IM node.exe`, then `npm run dev` again in `backend-core`.
-- **"Extension context invalidated" error** — Reload the extension on `chrome://extensions`, then refresh any open AI chat tabs.
-- **Popup shows "Bank offline"** — The backend isn't running. Start it with `npm run dev` in `backend-core`.
-- **Balance shows but no activity** — Rebuild the extension (`npm run build` in `client-extension`) and reload it on `chrome://extensions`.
-
-## Testing
-
-Automated smoke tests verify the full API surface (health, claims, surveys, ads, redemption guards, admin routes, partner attribution). Run against a local dev server or production:
+## Money utilities
 
 ```bash
 cd backend-core
-npm run dev          # in another terminal, if testing locally
-
-# Local (default http://localhost:3001)
-npm run smoke
-
-# Production or staging with admin coverage
-SMOKE_URL=https://omni-protocol-ai-waittime-production.up.railway.app SMOKE_ADMIN_KEY=your-admin-key npm run smoke
+npm run test:money
 ```
 
-- `SMOKE_URL` — base URL (default `http://localhost:3001`)
-- `SMOKE_ADMIN_KEY` — optional; when set, also verifies admin endpoints, partner flow, and redemptions list. Without it, those checks are skipped with `WARN`.
+Verifies ₹10 CPM → 1000 micropaise/impression → 600 / 400 split.
 
-Exit code is nonzero on any `FAIL`. Use this at the end of every dev session instead of a manual checklist.
+## SQLite → Supabase migration (dry-run)
+
+```bash
+npx tsx scripts/migrate-sqlite-to-supabase.ts --dry-run
+```
+
+Refuse test DBs; no secrets committed. Execute mode requires your service-role env (see script help).
+
+## API (legacy local)
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/health` | Liveness |
+| `GET` | `/api/v1/config` | Platform config (share bps, min wait) |
+| `POST` | `/api/v1/session/start` | Server wait session |
+| `POST` | `/api/v1/yield` | **Deprecated** fixed-reward path (smoke only) |
+| `GET` | `/api/v1/balance/:userId` | Wallet balance |
+
+## Testing
+
+```bash
+cd backend-core
+npm run typecheck
+npm run build
+npm run smoke          # against local server
+
+cd ../client-extension && npm run build
+cd ../b2b-sdk && npm run build
+```
+
+```bash
+SMOKE_URL=http://localhost:3001 SMOKE_ADMIN_KEY=your-admin-key npm run smoke
+```
+
+## Troubleshooting
+
+- **Port 3001 in use** — stop the other Node process, then `npm run dev` again.
+- **"Extension context invalidated"** — reload the extension, then refresh AI tabs.
+- **Popup shows API offline** — start `backend-core` on localhost:3001.

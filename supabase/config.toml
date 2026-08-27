@@ -1,0 +1,47 @@
+# OmniPiggy — local / linked Supabase project config (placeholders only).
+# Do NOT put secrets here. Link with: supabase link --project-ref <PROJECT_REF>
+
+project_id = "omni-piggy-local"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[db.pooler]
+enabled = false
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000"]
+enable_signup = true
+
+# Anonymous sign-in may be used later for extension installations before account
+# linking. Enable in the dashboard / auth config when ready; keep RLS tight.
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = true
+enable_confirmations = false

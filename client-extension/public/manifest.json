@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "OmniPiggy: Personal AI Dividend",
-  "version": "1.1.2",
-  "description": "Earn small rewards during AI wait time. Take a mindful break, answer a quick question, or claim a micro-dividend.",
+  "name": "OmniPiggy: AI Wait-Time Earnings",
+  "version": "1.2.0",
+  "description": "Earn a share of advertiser revenue during verified AI wait time. Sponsored waits only — no fixed rewards, no claim button.",
   "homepage_url": "https://portfoliobuilders.in",
   "permissions": ["storage"],
   "host_permissions": [
-    "https://omni-protocol-ai-waittime-production.up.railway.app/*",
+    "http://localhost:3001/*",
     "https://chatgpt.com/*",
     "https://claude.ai/*",
     "https://gemini.google.com/*",
