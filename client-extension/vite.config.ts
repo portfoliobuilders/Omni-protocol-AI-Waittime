@@ -71,6 +71,9 @@ function buildExtensionScripts(): Plugin {
 
 export default defineConfig({
   plugins: [react(), buildExtensionScripts()],
+  define: {
+    OMNI_API_BASE: JSON.stringify(process.env.OMNI_API_BASE ?? ""),
+  },
   publicDir: resolve(rootDir, "public"),
   build: {
     outDir,

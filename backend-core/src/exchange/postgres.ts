@@ -901,6 +901,44 @@ export async function listUserRedemptionsPg(userId: string): Promise<
   }));
 }
 
+export async function getRecentEarningsPg(
+  userId: string,
+  limit = 10,
+): Promise<
+  Array<{
+    id: string;
+    entryType: string;
+    amountMicropaise: number;
+    platform: string | null;
+    createdAt: string;
+  }>
+> {
+  const sb = getServiceSupabase();
+  const profileId = profileIdFromUserId(userId);
+  const { data: wallet } = await sb
+    .from("wallets")
+    .select("id")
+    .eq("profile_id", profileId)
+    .maybeSingle();
+  if (!wallet?.id) return [];
+
+  const { data } = await sb
+    .from("ledger_entries")
+    .select("id, entry_type, amount_micropaise, created_at")
+    .eq("wallet_id", wallet.id)
+    .gt("amount_micropaise", 0)
+    .order("created_at", { ascending: false })
+    .limit(Math.min(limit, 50));
+
+  return (data ?? []).map((row) => ({
+    id: row.id as string,
+    entryType: row.entry_type as string,
+    amountMicropaise: Number(row.amount_micropaise),
+    platform: null,
+    createdAt: row.created_at as string,
+  }));
+}
+
 export async function reviewCampaignPg(
   campaignId: string,
   decision: "approve" | "reject",

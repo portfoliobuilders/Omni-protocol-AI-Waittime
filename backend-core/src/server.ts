@@ -52,6 +52,7 @@ import {
   createCampaignFromPaiseInput,
   createFundedCampaignPg,
   getPlatformHealthPg,
+  getRecentEarningsPg,
   getWalletPg,
   listCampaignsAdminPg,
   listUserRedemptionsPg,
@@ -98,6 +99,20 @@ const REWARD_ECONOMICS = {
     omniBps: 4000,
   },
 } as const;
+
+/** Remote platform toggles for extension (disable without release). */
+const EXTENSION_PLATFORMS = [
+  { id: "chatgpt", name: "ChatGPT", enabled: true, sponsoredWaitEnabled: true, hosts: ["chatgpt.com"] },
+  { id: "claude", name: "Claude", enabled: true, sponsoredWaitEnabled: true, hosts: ["claude.ai"] },
+  { id: "gemini", name: "Gemini", enabled: true, sponsoredWaitEnabled: true, hosts: ["gemini.google.com"] },
+  { id: "perplexity", name: "Perplexity", enabled: true, sponsoredWaitEnabled: true, hosts: ["perplexity.ai", "www.perplexity.ai"] },
+  { id: "copilot", name: "Copilot", enabled: true, sponsoredWaitEnabled: true, hosts: ["copilot.microsoft.com"] },
+  { id: "deepseek", name: "DeepSeek", enabled: true, sponsoredWaitEnabled: true, hosts: ["chat.deepseek.com"] },
+  { id: "grok", name: "Grok", enabled: true, sponsoredWaitEnabled: true, hosts: ["grok.com"] },
+  { id: "meta_ai", name: "Meta AI", enabled: true, sponsoredWaitEnabled: true, hosts: ["meta.ai", "www.meta.ai"] },
+  { id: "mistral", name: "Le Chat", enabled: true, sponsoredWaitEnabled: true, hosts: ["chat.mistral.ai"] },
+  { id: "poe", name: "Poe", enabled: true, sponsoredWaitEnabled: true, hosts: ["poe.com", "www.poe.com"] },
+] as const;
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
 const PORT = Number(process.env.PORT ?? 3001);
@@ -278,6 +293,30 @@ function parseUserId(userIdValue: unknown): string {
   return userId;
 }
 
+/** Map Phase 3 extension telemetry to DB-allowed platform_events vocabulary. */
+function mapTelemetryEvent(raw: string): string {
+  const map: Record<string, string> = {
+    wait_detected: "detected",
+    session_started: "shown",
+    ad_requested: "shown",
+    ad_returned: "rendered",
+    no_fill: "error",
+    ad_rendered: "rendered",
+    ad_viewable: "rendered",
+    ad_dismissed: "error",
+    impression_qualify_requested: "qualified",
+    impression_qualified: "qualified",
+    impression_settled: "settled",
+    settlement_failed: "error",
+    wait_short: "wait_ended",
+    wait_ended: "wait_ended",
+    duplicate_prevented: "settled",
+    platform_error: "error",
+    click: "shown",
+  };
+  return map[raw] ?? (raw || "error");
+}
+
 function parseOptionalPartnerKey(value: unknown): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -443,6 +482,16 @@ app.get("/api/v1/config", (_req: Request, res: Response) => {
         cashRevenueShareAllowed: p.cashRevenueShareAllowed,
         settlementMode: p.settlementMode,
       })),
+      platform: {
+        currency: REWARD_ECONOMICS.currency,
+        symbol: REWARD_ECONOMICS.symbol,
+        minRedemption: REWARD_ECONOMICS.minRedemption,
+        minWaitSeconds: REWARD_ECONOMICS.minWaitSeconds,
+        userRevenueShareBps: exchange.userRevenueShareBps,
+        omniRevenueShareBps: exchange.omniRevenueShareBps,
+        minimumQualifiedViewMs: exchange.minimumQualifiedViewMs,
+      },
+      platforms: EXTENSION_PLATFORMS,
     },
   });
 });
@@ -696,6 +745,16 @@ app.get("/api/v1/exchange/wallet/:userId", safeRoute(async (req, res) => {
   });
 }));
 
+app.get("/api/v1/exchange/recent/:userId", safeRoute(async (req, res) => {
+  const userId = parseUserId(req.params.userId);
+  const limit = Math.min(
+    50,
+    Math.max(1, Number(req.query.limit) || 10),
+  );
+  const earnings = await getRecentEarningsPg(userId, limit);
+  res.status(200).json({ success: true, data: { earnings } });
+}));
+
 app.post("/api/v1/telemetry", safeRoute(async (req, res) => {
   const body = req.body as {
     host?: unknown;
@@ -707,7 +766,8 @@ app.post("/api/v1/telemetry", safeRoute(async (req, res) => {
     throw new ValidationError("host is required (max 128 chars).");
   }
   const userId = parseUserId(body.userId);
-  const event = typeof body.event === "string" ? body.event.trim() : "";
+  const rawEvent = typeof body.event === "string" ? body.event.trim() : "";
+  const event = mapTelemetryEvent(rawEvent);
   const result = await recordPlatformEventPg(userId, host, event);
   if (!result.ok) {
     res.status(400).json({ success: false, message: "Invalid telemetry event." });

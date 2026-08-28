@@ -1,28 +1,18 @@
-// Default local API. Set OMNI_API_BASE in .env.example for deployment.
-// For local Chrome loads, host_permissions must include this origin.
-const API_BASE_URL = "http://localhost:3001";
+import type { BackgroundMessage, BackgroundResponse } from "../shared/messages";
+import type { ExchangeWallet, OmniConfig, PlatformConfig } from "../shared/types";
+
+// Override at build time: OMNI_API_BASE=http://localhost:3001 npm run build
+declare const OMNI_API_BASE: string | undefined;
+const API_BASE_URL =
+  typeof OMNI_API_BASE !== "undefined" && OMNI_API_BASE
+    ? OMNI_API_BASE.replace(/\/$/, "")
+    : "http://localhost:3001";
 const API_BASE = `${API_BASE_URL}/api/v1`;
 const HEALTH_URL = `${API_BASE_URL}/health`;
-const REQUEST_TIMEOUT_MS = 5000;
-const EARNINGS_KEY = "omniEarnings";
+const REQUEST_TIMEOUT_MS = 8000;
 const USER_ID_KEY = "omniUserId";
 
 let cachedUserId: string | null = null;
-
-export interface PlatformConfig {
-  currency: string;
-  symbol: string;
-  minRedemption: number;
-  minWaitSeconds: number;
-  userRevenueShareBps: number;
-  omniRevenueShareBps: number;
-  /** @deprecated Fixed rewards removed — kept only if server still returns them. */
-  tier2Amount?: number;
-  /** @deprecated Fixed rewards removed — kept only if server still returns them. */
-  tier3Amount?: number;
-  /** @deprecated Fixed rewards removed. */
-  tier3Seconds?: number;
-}
 
 const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   currency: "INR",
@@ -31,55 +21,8 @@ const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   minWaitSeconds: 5,
   userRevenueShareBps: 6000,
   omniRevenueShareBps: 4000,
+  minimumQualifiedViewMs: 5000,
 };
-
-const CONFIG_TTL_MS = 10 * 60 * 1000;
-let cachedPlatformConfig: PlatformConfig | null = null;
-let configFetchedAt = 0;
-
-interface Transaction {
-  id: number;
-  user_id: string;
-  amount: number;
-  layer: string;
-  nonce: string;
-  created_at: string;
-}
-
-interface Redemption {
-  id: number;
-  user_id: string;
-  amount: number;
-  method: string;
-  detail: string;
-  status: string;
-  created_at: string;
-  resolved_at: string | null;
-}
-
-type ApiMessage =
-  | { type: "SESSION_START"; payload?: undefined }
-  | { type: "GET_AD"; payload?: undefined }
-  | {
-      type: "AD_EVENT";
-      payload: {
-        adId: number;
-        event: "impression" | "click";
-        campaignId?: number;
-      };
-    }
-  | { type: "GET_WALLET"; payload?: { limit?: number } }
-  | { type: "GET_HEALTH"; payload?: undefined }
-  | {
-      type: "REDEEM";
-      payload: { method: "amazon_voucher" | "upi"; detail: string };
-    }
-  | { type: "GET_REDEMPTIONS"; payload?: undefined }
-  | { type: "GET_CONFIG"; payload?: undefined };
-
-type ApiResponse =
-  | { ok: true; data: unknown; status?: number }
-  | { ok: false; error: string; status?: number };
 
 class BackendError extends Error {
   constructor(
@@ -97,12 +40,8 @@ async function fetchWithTimeout(
 ): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
   try {
-    return await fetch(input, {
-      ...init,
-      signal: controller.signal,
-    });
+    return await fetch(input, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timeoutId);
   }
@@ -114,7 +53,6 @@ async function requestJson<T>(
 ): Promise<T> {
   const response = await fetchWithTimeout(input, init);
   const data = (await response.json()) as T;
-
   if (!response.ok) {
     let message = `Backend responded with ${response.status}`;
     if (typeof data === "object" && data !== null) {
@@ -125,186 +63,20 @@ async function requestJson<T>(
     }
     throw new BackendError(message, response.status);
   }
-
   return data;
 }
 
-export function startSession(userId: string): Promise<unknown> {
-  return requestJson(`${API_BASE}/session/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userId }),
-  });
-}
-
-export function getBalance(userId: string): Promise<unknown> {
-  return requestJson(`${API_BASE}/balance/${encodeURIComponent(userId)}`);
-}
-
-export function getAdNext(): Promise<unknown> {
-  return requestJson(`${API_BASE}/ad/next`);
-}
-
-export function postAdEvent(
-  adId: number,
-  userId: string,
-  event: "impression" | "click",
-  campaignId?: number,
-): Promise<unknown> {
-  const body: Record<string, unknown> = { adId, userId, event };
-  if (typeof campaignId === "number" && campaignId > 0) {
-    body.campaignId = campaignId;
+export async function ensureUserId(): Promise<string> {
+  if (cachedUserId) return cachedUserId;
+  const stored = await storageGetString(USER_ID_KEY);
+  if (stored) {
+    cachedUserId = stored;
+    return stored;
   }
-  return requestJson(`${API_BASE}/ad/event`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-export function getTransactions(
-  userId: string,
-  limit: number,
-): Promise<unknown> {
-  const params = new URLSearchParams({ limit: String(limit) });
-  return requestJson(
-    `${API_BASE}/transactions/${encodeURIComponent(userId)}?${params}`,
-  );
-}
-
-export function postRedeem(
-  userId: string,
-  method: "amazon_voucher" | "upi",
-  detail: string,
-): Promise<unknown> {
-  return requestJson(`${API_BASE}/redeem`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userId, method, detail }),
-  });
-}
-
-export function getRedemptions(userId: string): Promise<unknown> {
-  return requestJson(
-    `${API_BASE}/redemptions/${encodeURIComponent(userId)}`,
-  );
-}
-
-function parseConfigResponse(json: unknown): PlatformConfig {
-  const raw =
-    typeof json === "object" && json !== null
-      ? ((json as Record<string, unknown>).data ?? json)
-      : null;
-
-  if (typeof raw !== "object" || raw === null) {
-    return DEFAULT_PLATFORM_CONFIG;
-  }
-
-  const obj = raw as Record<string, unknown>;
-  const pickNum = (key: keyof PlatformConfig, fallback: number): number => {
-    const value = obj[key];
-    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-  };
-  const pickStr = (key: keyof PlatformConfig, fallback: string): string => {
-    const value = obj[key];
-    return typeof value === "string" && value ? value : fallback;
-  };
-
-  return {
-    currency: pickStr("currency", DEFAULT_PLATFORM_CONFIG.currency),
-    symbol: pickStr("symbol", DEFAULT_PLATFORM_CONFIG.symbol),
-    minRedemption: pickNum(
-      "minRedemption",
-      DEFAULT_PLATFORM_CONFIG.minRedemption,
-    ),
-    minWaitSeconds: pickNum(
-      "minWaitSeconds",
-      DEFAULT_PLATFORM_CONFIG.minWaitSeconds,
-    ),
-    userRevenueShareBps: pickNum(
-      "userRevenueShareBps",
-      DEFAULT_PLATFORM_CONFIG.userRevenueShareBps,
-    ),
-    omniRevenueShareBps: pickNum(
-      "omniRevenueShareBps",
-      DEFAULT_PLATFORM_CONFIG.omniRevenueShareBps,
-    ),
-  };
-}
-
-export async function getPlatformConfig(): Promise<PlatformConfig> {
-  if (cachedPlatformConfig && Date.now() - configFetchedAt < CONFIG_TTL_MS) {
-    return cachedPlatformConfig;
-  }
-
-  try {
-    const json = await requestJson<unknown>(`${API_BASE}/config`);
-    const config = parseConfigResponse(json);
-    cachedPlatformConfig = config;
-    configFetchedAt = Date.now();
-    return config;
-  } catch {
-    return DEFAULT_PLATFORM_CONFIG;
-  }
-}
-
-export async function getHealth(): Promise<unknown> {
-  const response = await fetchWithTimeout(HEALTH_URL);
-  const data = await response.json().catch(() => ({ ok: response.ok }));
-
-  if (!response.ok) {
-    throw new BackendError(
-      `Health endpoint responded with ${response.status}`,
-      response.status,
-    );
-  }
-
-  return data;
-}
-
-function parseBalanceResponse(json: unknown): number {
-  if (typeof json === "object" && json !== null) {
-    const obj = json as Record<string, unknown>;
-    if (typeof obj.balance === "number") return obj.balance;
-    if (typeof obj.data === "object" && obj.data !== null) {
-      const data = obj.data as Record<string, unknown>;
-      if (typeof data.balance === "number") return data.balance;
-    }
-  }
-
-  throw new BackendError("Unexpected balance response shape");
-}
-
-function parseTransactionsResponse(json: unknown): Transaction[] {
-  if (Array.isArray(json)) return json as Transaction[];
-  if (typeof json === "object" && json !== null) {
-    const obj = json as Record<string, unknown>;
-    if (Array.isArray(obj.data)) return obj.data as Transaction[];
-    if (Array.isArray(obj.transactions)) return obj.transactions as Transaction[];
-    if (typeof obj.data === "object" && obj.data !== null) {
-      const data = obj.data as Record<string, unknown>;
-      if (Array.isArray(data.transactions)) {
-        return data.transactions as Transaction[];
-      }
-    }
-  }
-
-  throw new BackendError("Unexpected transactions response shape");
-}
-
-function parseRedemptionsResponse(json: unknown): Redemption[] {
-  if (typeof json === "object" && json !== null) {
-    const obj = json as Record<string, unknown>;
-    if (Array.isArray(obj.redemptions)) return obj.redemptions as Redemption[];
-    if (typeof obj.data === "object" && obj.data !== null) {
-      const data = obj.data as Record<string, unknown>;
-      if (Array.isArray(data.redemptions)) {
-        return data.redemptions as Redemption[];
-      }
-    }
-  }
-
-  throw new BackendError("Unexpected redemptions response shape");
+  const userId = crypto.randomUUID();
+  await storageSet({ [USER_ID_KEY]: userId });
+  cachedUserId = userId;
+  return userId;
 }
 
 function storageSet(values: Record<string, unknown>): Promise<void> {
@@ -322,97 +94,137 @@ function storageGetString(key: string): Promise<string | undefined> {
   });
 }
 
-export async function ensureUserId(): Promise<string> {
-  if (cachedUserId) return cachedUserId;
-
-  const stored = await storageGetString(USER_ID_KEY);
-  if (stored) {
-    cachedUserId = stored;
-    return stored;
-  }
-
-  const userId = crypto.randomUUID();
-  await storageSet({ [USER_ID_KEY]: userId });
-  cachedUserId = userId;
-  return userId;
-}
-
-async function updateStoredEarnings(amount: number): Promise<void> {
-  const current = await new Promise<number>((resolve) => {
-    chrome.storage.local.get([EARNINGS_KEY], (result) => {
-      resolve(Number(result[EARNINGS_KEY] ?? 0));
-    });
-  });
-  const next = Math.round((current + amount) * 100) / 100;
-  await storageSet({ [EARNINGS_KEY]: next });
-}
-
-async function handleMessage(message: ApiMessage): Promise<ApiResponse> {
+async function handleMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
   const userId = await ensureUserId();
 
   switch (message.type) {
-    case "SESSION_START":
-      return { ok: true, data: await startSession(userId) };
+    case "START_WAIT_SESSION": {
+      const data = await requestJson(`${API_BASE}/session/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          platform: message.payload.platform,
+        }),
+      });
+      return { ok: true, data };
+    }
 
-    case "GET_AD":
-      return { ok: true, data: await getAdNext() };
+    case "REQUEST_WAIT_AD": {
+      const data = await requestJson(`${API_BASE}/ad/request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          waitSessionId: message.payload.waitSessionId,
+        }),
+      });
+      return { ok: true, data };
+    }
 
-    case "AD_EVENT": {
-      const data = await postAdEvent(
-        message.payload.adId,
-        userId,
-        message.payload.event,
-        message.payload.campaignId,
+    case "QUALIFY_IMPRESSION": {
+      const data = await requestJson(`${API_BASE}/impression/qualify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          impressionId: message.payload.impressionId,
+          reportedViewMs: message.payload.reportedViewMs,
+        }),
+      });
+      return { ok: true, data };
+    }
+
+    case "END_WAIT_SESSION":
+      return { ok: true, data: { ended: true } };
+
+    case "TRACK_AD_CLICK": {
+      await requestJson(`${API_BASE}/telemetry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          host: "ad_click",
+          event: "click",
+        }),
+      }).catch(() => undefined);
+      return { ok: true, data: { tracked: true } };
+    }
+
+    case "TRACK_TELEMETRY": {
+      const data = await requestJson(`${API_BASE}/telemetry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          host: message.payload.host,
+          event: message.payload.event,
+        }),
+      });
+      return { ok: true, data };
+    }
+
+    case "REPORT_AD": {
+      const data = await requestJson(`${API_BASE}/telemetry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          host: "report",
+          event: "error",
+        }),
+      }).catch(() => ({ success: true }));
+      return { ok: true, data };
+    }
+
+    case "GET_OMNI_CONFIG": {
+      const json = await requestJson<{ success: boolean; data: OmniConfig }>(
+        `${API_BASE}/config`,
       );
-      const payload = data as {
-        data?: { revenue?: { credited_rupees?: number } | null };
-      };
-      const credited = Number(payload.data?.revenue?.credited_rupees ?? 0);
-      if (credited > 0) {
-        await updateStoredEarnings(credited);
+      return { ok: true, data: json };
+    }
+
+    case "GET_EXCHANGE_WALLET": {
+      const json = await requestJson<{ success: boolean; data: ExchangeWallet }>(
+        `${API_BASE}/exchange/wallet/${encodeURIComponent(userId)}`,
+      );
+      return { ok: true, data: json };
+    }
+
+    case "GET_RECENT_EARNINGS": {
+      const limit = message.payload?.limit ?? 10;
+      const json = await requestJson(`${API_BASE}/exchange/recent/${encodeURIComponent(userId)}?limit=${limit}`);
+      return { ok: true, data: json };
+    }
+
+    case "GET_HEALTH": {
+      const response = await fetchWithTimeout(HEALTH_URL);
+      const data = await response.json().catch(() => ({ ok: response.ok }));
+      if (!response.ok) {
+        throw new BackendError(`Health ${response.status}`, response.status);
       }
       return { ok: true, data };
     }
 
-    case "GET_WALLET": {
-      const limit = message.payload?.limit ?? 10;
-      const [balanceJson, transactionsJson] = await Promise.all([
-        getBalance(userId),
-        getTransactions(userId, limit),
-      ]);
-
-      return {
-        ok: true,
-        data: {
-          balance: parseBalanceResponse(balanceJson),
-          transactions: parseTransactionsResponse(transactionsJson),
-        },
-      };
-    }
-
-    case "GET_HEALTH":
-      return { ok: true, data: await getHealth() };
-
     case "REDEEM": {
-      const data = await postRedeem(
-        userId,
-        message.payload.method,
-        message.payload.detail,
-      );
-      await storageSet({ [EARNINGS_KEY]: 0 });
+      const data = await requestJson(`${API_BASE}/redeem`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          method: message.payload.method,
+          detail: message.payload.detail,
+        }),
+      });
       return { ok: true, data };
     }
 
-    case "GET_REDEMPTIONS":
-      return {
-        ok: true,
-        data: {
-          redemptions: parseRedemptionsResponse(await getRedemptions(userId)),
-        },
-      };
-
-    case "GET_CONFIG":
-      return { ok: true, data: await getPlatformConfig() };
+    case "GET_REDEMPTIONS": {
+      const data = await requestJson(
+        `${API_BASE}/redemptions/${encodeURIComponent(userId)}`,
+      );
+      return { ok: true, data };
+    }
   }
 }
 
@@ -420,7 +232,7 @@ chrome.runtime.onInstalled.addListener(() => {
   void ensureUserId();
 });
 
-chrome.runtime.onMessage.addListener((message: ApiMessage, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: BackgroundMessage, _sender, sendResponse) => {
   void handleMessage(message)
     .then(sendResponse)
     .catch((error: unknown) => {
@@ -431,6 +243,7 @@ chrome.runtime.onMessage.addListener((message: ApiMessage, _sender, sendResponse
         status: backendError?.status,
       });
     });
-
   return true;
 });
+
+void DEFAULT_PLATFORM_CONFIG;

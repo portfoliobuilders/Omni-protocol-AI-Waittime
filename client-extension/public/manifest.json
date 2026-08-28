@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "OmniPiggy: AI Wait-Time Earnings",
-  "version": "1.2.0",
-  "description": "Earn a share of advertiser revenue during verified AI wait time. Sponsored waits only — no fixed rewards, no claim button.",
+  "name": "OmniPiggy: Sponsored AI Wait",
+  "version": "2.0.0",
+  "description": "Earn a share of advertiser revenue from clearly labelled sponsored waits during AI generation. No fixed rewards.",
   "homepage_url": "https://portfoliobuilders.in",
   "permissions": ["storage"],
   "host_permissions": [
