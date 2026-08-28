@@ -12,6 +12,9 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
+/** Shared SQLite handle for Exchange modules (local/CI bridge). */
+export { db };
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -149,20 +152,29 @@ db.exec(`
     ON revenue_events (user_id, created_at DESC);
 `);
 
-/** Percent shares of campaign impression gross spend (must sum to 100). */
+/**
+ * @deprecated Phase 2: 60/20/20 is no longer the consumer contract.
+ * Consumer direct ads use 60% user / 40% Omni (see exchange + micropaise).
+ * Kept temporarily so old revenue_events rows remain readable.
+ */
 export const EARNER_SHARE = 60;
-export const POOL_SHARE = 20;
-export const PLATFORM_SHARE = 20;
+/** @deprecated Use omni 40% share — pool is not a separate settlement bucket. */
+export const POOL_SHARE = 0;
+/** @deprecated Omni share is 40% of gross; not a separate 20% platform slice. */
+export const PLATFORM_SHARE = 40;
 
-/** Split integer paise so earner + pool + platform === gross (remainder → platform). */
+/**
+ * @deprecated Prefer splitRevenueMicropaise from money/micropaise.
+ * Maps to 60% earner / 40% omni (platform), pool always 0.
+ */
 export function splitRevenuePaise(grossPaise: number): {
   earner_paise: number;
   pool_paise: number;
   platform_paise: number;
 } {
   const gross = Math.max(0, Math.floor(grossPaise));
-  const earner_paise = Math.floor((gross * EARNER_SHARE) / 100);
-  const pool_paise = Math.floor((gross * POOL_SHARE) / 100);
+  const earner_paise = Math.floor((gross * 60) / 100);
+  const pool_paise = 0;
   const platform_paise = gross - earner_paise - pool_paise;
   return { earner_paise, pool_paise, platform_paise };
 }

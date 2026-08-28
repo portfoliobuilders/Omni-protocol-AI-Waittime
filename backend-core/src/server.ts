@@ -7,18 +7,14 @@ import path from "node:path";
 import {
   addAd,
   addSurveyQuestion,
-  applyYield,
   backupDatabase,
-  consumeClaimSession,
   ContentValidationError,
-  createCampaign,
   createClaimSession,
   createPartner,
   DuplicateTransactionError,
   EARNER_SHARE,
   getActiveAd,
   getAdStats,
-  getAllCampaignsAdmin,
   getBalance,
   getCampaignStats,
   getLedgerStats,
@@ -31,7 +27,6 @@ import {
   getServableCampaign,
   getSurveyResults,
   getTransactions,
-  getUserRedemptions,
   listTopupRequests,
   pauseAdvertiserCampaign,
   PLATFORM_SHARE,
@@ -39,75 +34,74 @@ import {
   recordAdEvent,
   recordCampaignClick,
   recordCampaignImpression,
-  recordSurveyResponse,
   requestCampaignTopup,
-  requestRedemption,
   resetLedger,
   resolveRedemption,
   resolveTopupRequest,
   resumeAdvertiserCampaign,
-  reviewCampaign,
   setAdActive,
   setPartnerActive,
   setSurveyQuestionActive,
   verifyAdvertiser,
 } from "./db";
+import { getExchangeConfig } from "./exchange/config";
+import {
+  backdateWaitSessionPg,
+  confirmAdvertiserFundingPg,
+  createAdRequestPg,
+  createCampaignFromPaiseInput,
+  createFundedCampaignPg,
+  getPlatformHealthPg,
+  getWalletPg,
+  listCampaignsAdminPg,
+  listUserRedemptionsPg,
+  qualifyAndSettlePg,
+  recordPlatformEventPg,
+  requestRedemptionPg,
+  reviewCampaignPg,
+  setCampaignProviderPg,
+  startWaitSessionPg,
+} from "./exchange/postgres";
+import { BUILTIN_PROVIDERS } from "./exchange/providers";
+import { assertPostgresExchangeReady } from "./exchange/supabaseClient";
+
+// Keep typecheck happy for admin/test helpers re-exported via routes later.
+void createFundedCampaignPg;
+void backdateWaitSessionPg;
 
 dotenv.config();
+assertPostgresExchangeReady();
 
 /**
- * Platform economics (INR display + share config).
- * Fixed ₹2/₹10 claim rewards are DEPRECATED — kept only so legacy /yield
- * smoke paths still function until Phase 2 settlement replaces them.
- * Clients must not treat tier*Amount as product UX.
+ * Platform economics — authoritative consumer split is 60% user / 40% Omni.
+ * Fixed ₹2/₹10 tiers are deprecated and must not mint money.
  */
 const REWARD_ECONOMICS = {
   currency: "INR",
   symbol: "₹",
   minRedemption: 100,
   minWaitSeconds: 5,
-  /** Basis points: 6000 = 60% user share of qualifying advertiser revenue. */
   userRevenueShareBps: 6000,
-  /** Basis points: 4000 = 40% Omni share. */
   omniRevenueShareBps: 4000,
-  /** @deprecated Phase 1 — do not surface in product UI. */
+  /** @deprecated — not a production money path */
   tier2Amount: 2,
-  /** @deprecated Phase 1 — do not surface in product UI. */
+  /** @deprecated — not a production money path */
   tier3Amount: 10,
-  /** @deprecated Phase 1 — do not surface in product UI. */
+  /** @deprecated */
   tier3Seconds: 15,
-  /** Campaign impression revenue split (percent). Enforced server-side in paise. */
+  /** @deprecated 60/20/20 removed; earner=60, pool=0, platform/omni=40 */
   revenueShare: {
     earner: EARNER_SHARE,
     pool: POOL_SHARE,
     platform: PLATFORM_SHARE,
+    userBps: 6000,
+    omniBps: 4000,
   },
 } as const;
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
 const PORT = Number(process.env.PORT ?? 3001);
 const ADMIN_KEY = process.env.OMNI_ADMIN_KEY;
-const VALID_LAYERS = new Set([
-  "activeAiLayer",
-  "behavioralLayer",
-  "passiveDepinLayer",
-]);
-
-type YieldLayer =
-  | "activeAiLayer"
-  | "behavioralLayer"
-  | "passiveDepinLayer";
-
-interface YieldRequestBody {
-  userId?: unknown;
-  amount?: unknown;
-  layer?: unknown;
-  nonce?: unknown;
-  sessionToken?: unknown;
-  surveyQuestionId?: unknown;
-  surveyAnswer?: unknown;
-  partnerKey?: unknown;
-}
 
 interface SessionStartRequestBody {
   userId?: unknown;
@@ -153,16 +147,6 @@ interface ResolveRedemptionBody {
   status?: unknown;
 }
 
-interface YieldTransaction {
-  userId: string;
-  layer: YieldLayer;
-  nonce: string;
-  sessionToken: string;
-  surveyQuestionId?: number;
-  surveyAnswer?: string;
-  timestamp: string;
-}
-
 const app = express();
 
 app.disable("x-powered-by");
@@ -183,6 +167,9 @@ const RATE_LIMIT_MAX_POSTS = 30;
 const rateLimitByIp = new Map<string, number[]>();
 const RATE_LIMITED_POST_PATHS = new Set([
   "/api/v1/session/start",
+  "/api/v1/ad/request",
+  "/api/v1/impression/qualify",
+  "/api/v1/telemetry",
   "/api/v1/yield",
   "/api/v1/redeem",
   "/api/v1/ad/event",
@@ -330,96 +317,6 @@ function resolvePartnerId(
   return partner.id;
 }
 
-function parseYieldRequest(body: YieldRequestBody): YieldTransaction {
-  const userId = parseUserId(body.userId);
-
-  if (body.amount !== undefined) {
-    const amount =
-      typeof body.amount === "number"
-        ? body.amount
-        : typeof body.amount === "string"
-          ? Number(body.amount)
-          : NaN;
-
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new ValidationError("amount must be a positive number.");
-    }
-  }
-
-  const layer =
-    typeof body.layer === "string" ? body.layer.trim() : "";
-
-  if (!VALID_LAYERS.has(layer)) {
-    throw new ValidationError(
-      `layer must be one of: ${[...VALID_LAYERS].join(", ")}.`,
-    );
-  }
-
-  const nonce =
-    typeof body.nonce === "string" ? body.nonce.trim() : "";
-
-  if (!nonce) {
-    throw new ValidationError("nonce is required and must be a non-empty string.");
-  }
-
-  if (nonce.length > 128) {
-    throw new ValidationError("nonce must be 128 characters or fewer.");
-  }
-
-  const sessionToken =
-    typeof body.sessionToken === "string" ? body.sessionToken.trim() : "";
-
-  if (!sessionToken) {
-    throw new ValidationError(
-      "sessionToken is required and must be a non-empty string.",
-    );
-  }
-
-  if (sessionToken.length > 128) {
-    throw new ValidationError("sessionToken must be 128 characters or fewer.");
-  }
-
-  const hasSurveyQuestionId = body.surveyQuestionId !== undefined;
-  const hasSurveyAnswer = body.surveyAnswer !== undefined;
-
-  if (hasSurveyQuestionId !== hasSurveyAnswer) {
-    throw new ValidationError(
-      "surveyQuestionId and surveyAnswer must be provided together.",
-    );
-  }
-
-  const surveyQuestionId =
-    typeof body.surveyQuestionId === "number" ? body.surveyQuestionId : NaN;
-  const surveyAnswer =
-    typeof body.surveyAnswer === "string" ? body.surveyAnswer.trim() : "";
-
-  if (
-    hasSurveyQuestionId &&
-    (!Number.isInteger(surveyQuestionId) || surveyQuestionId <= 0)
-  ) {
-    throw new ValidationError("surveyQuestionId must be a positive integer.");
-  }
-
-  if (hasSurveyAnswer && !surveyAnswer) {
-    throw new ValidationError(
-      "surveyAnswer must be a non-empty string when provided.",
-    );
-  }
-
-  if (hasSurveyAnswer && surveyAnswer.length > 256) {
-    throw new ValidationError("surveyAnswer must be 256 characters or fewer.");
-  }
-
-  return {
-    userId,
-    layer: layer as YieldLayer,
-    nonce,
-    sessionToken,
-    ...(hasSurveyQuestionId ? { surveyQuestionId, surveyAnswer } : {}),
-    timestamp: new Date().toISOString(),
-  };
-}
-
 class ValidationError extends Error {
   constructor(message: string) {
     super(message);
@@ -531,9 +428,22 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.get("/api/v1/config", (_req: Request, res: Response) => {
+  const exchange = getExchangeConfig();
   res.status(200).json({
     success: true,
-    data: { ...REWARD_ECONOMICS },
+    data: {
+      ...REWARD_ECONOMICS,
+      userRevenueShareBps: exchange.userRevenueShareBps,
+      omniRevenueShareBps: exchange.omniRevenueShareBps,
+      minimumQualifiedViewMs: exchange.minimumQualifiedViewMs,
+      minimumCpmMicropaise: exchange.minimumCpmMicropaise,
+      demandProviders: BUILTIN_PROVIDERS.filter((p) => p.enabled).map((p) => ({
+        providerKey: p.providerKey,
+        providerType: p.providerType,
+        cashRevenueShareAllowed: p.cashRevenueShareAllowed,
+        settlementMode: p.settlementMode,
+      })),
+    },
   });
 });
 
@@ -612,38 +522,34 @@ app.get("/privacy", (_req: Request, res: Response) => {
 </html>`);
 });
 
-app.post("/api/v1/session/start", (req: Request, res: Response) => {
-  try {
-    const body = req.body as SessionStartRequestBody;
-    const partnerKey = parseOptionalPartnerKey(body.partnerKey);
-    const partnerId = resolvePartnerId(partnerKey, res);
-    if (partnerId === null) {
-      return;
-    }
-
-    const userId = parseUserId(body.userId);
-    const sessionToken = createClaimSession(userId);
-
-    res.status(200).json({
-      success: true,
-      data: { sessionToken },
-    });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Session] Unexpected error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
+app.post("/api/v1/session/start", safeRoute(async (req, res) => {
+  const body = req.body as SessionStartRequestBody & { platform?: unknown };
+  const partnerKey = parseOptionalPartnerKey(body.partnerKey);
+  const partnerId = resolvePartnerId(partnerKey, res);
+  if (partnerId === null) {
+    return;
   }
-});
+
+  const userId = parseUserId(body.userId);
+  const platform =
+    typeof body.platform === "string" && body.platform.trim()
+      ? body.platform.trim().slice(0, 64)
+      : "unknown";
+
+  const sessionToken = createClaimSession(userId);
+  const wait = await startWaitSessionPg(userId, platform);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      sessionToken,
+      waitSessionId: wait.id,
+      serverNonce: wait.server_nonce,
+      startedAt: wait.started_at,
+      platform: wait.platform,
+    },
+  });
+}));
 
 app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
   try {
@@ -671,123 +577,153 @@ app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/v1/yield", (req: Request, res: Response) => {
-  try {
-    const partnerKey = parseOptionalPartnerKey(
-      (req.body as YieldRequestBody).partnerKey,
-    );
-    const partnerId = resolvePartnerId(partnerKey, res);
-    if (partnerId === null) {
-      return;
-    }
 
-    const transaction = parseYieldRequest(req.body as YieldRequestBody);
-    const isSurveyClaim =
-      transaction.surveyQuestionId !== undefined &&
-      transaction.surveyAnswer !== undefined;
-    const creditedAmount = isSurveyClaim
-      ? REWARD_ECONOMICS.tier3Amount
-      : REWARD_ECONOMICS.tier2Amount;
-    const minWaitSeconds = isSurveyClaim
-      ? REWARD_ECONOMICS.tier3Seconds
-      : REWARD_ECONOMICS.minWaitSeconds;
-
-    const sessionResult = consumeClaimSession(
-      transaction.sessionToken,
-      transaction.userId,
-      minWaitSeconds,
-    );
-
-    if (!sessionResult.ok) {
-      if (sessionResult.reason === "invalid") {
-        res.status(403).json({
-          success: false,
-          message: "Invalid or already used session.",
-        });
-        return;
-      }
-
-      res.status(403).json({
-        success: false,
-        message: "Wait period not satisfied.",
-      });
-      return;
-    }
-
-    if (
-      transaction.surveyQuestionId !== undefined &&
-      transaction.surveyAnswer !== undefined
-    ) {
-      const surveyResult = recordSurveyResponse(
-        transaction.userId,
-        transaction.surveyQuestionId,
-        transaction.surveyAnswer,
-      );
-
-      if (!surveyResult.ok) {
-        res.status(400).json({
-          success: false,
-          message:
-            surveyResult.reason === "already_answered"
-              ? "Survey question has already been answered."
-              : "Survey response is invalid.",
-        });
-        return;
-      }
-    }
-
-    const previousBalance = getBalance(transaction.userId);
-    const updatedBalance = applyYield({
-      userId: transaction.userId,
-      amount: creditedAmount,
-      layer: transaction.layer,
-      nonce: transaction.nonce,
-      ...(partnerId !== undefined ? { partnerId } : {}),
-    });
-
-    console.info("[Omni Yield] Transaction accepted", {
-      ...transaction,
-      creditedAmount,
-      previousBalance,
-      updatedBalance,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Yield transaction processed successfully.",
-      data: {
-        userId: transaction.userId,
-        creditedAmount,
-        layer: transaction.layer,
-        previousBalance,
-        updatedBalance,
-        processedAt: transaction.timestamp,
-      },
-    });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    if (error instanceof DuplicateTransactionError) {
-      res.status(200).json({
-        success: true,
-        duplicate: true,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Yield] Unexpected error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
+app.post("/api/v1/ad/request", safeRoute(async (req, res) => {
+  const body = req.body as {
+    userId?: unknown;
+    waitSessionId?: unknown;
+    preferredProvider?: unknown;
+  };
+  const userId = parseUserId(body.userId);
+  const waitSessionId =
+    typeof body.waitSessionId === "string" ? body.waitSessionId.trim() : "";
+  if (!waitSessionId) {
+    throw new ValidationError("waitSessionId is required.");
   }
+  const preferredProvider =
+    typeof body.preferredProvider === "string"
+      ? body.preferredProvider.trim()
+      : undefined;
+
+  const result = await createAdRequestPg({
+    waitSessionId,
+    userId,
+    preferredProvider,
+  });
+  if (!result.ok) {
+    res.status(400).json({ success: false, message: result.reason });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      adRequestId: result.adRequestId,
+      impressionId: result.impressionId,
+      providerKey: result.providerKey,
+      source: result.source,
+      campaignId: result.campaignId,
+      creative: result.creative,
+      sponsoredLabel: "Sponsored",
+      requiredViewMs: result.requiredViewMs,
+      cashRevenueShareAllowed: result.cashRevenueShareAllowed,
+    },
+  });
+}));
+
+app.post("/api/v1/impression/qualify", safeRoute(async (req, res) => {
+  const body = req.body as {
+    userId?: unknown;
+    impressionId?: unknown;
+    reportedViewMs?: unknown;
+    rewardAmount?: unknown;
+    userShare?: unknown;
+    grossRevenue?: unknown;
+  };
+
+  if (
+    body.rewardAmount !== undefined ||
+    body.userShare !== undefined ||
+    body.grossRevenue !== undefined
+  ) {
+    res.status(400).json({
+      success: false,
+      message: "Client must not submit reward or revenue amounts.",
+    });
+    return;
+  }
+
+  const userId = parseUserId(body.userId);
+  const impressionId =
+    typeof body.impressionId === "string" ? body.impressionId.trim() : "";
+  if (!impressionId) {
+    throw new ValidationError("impressionId is required.");
+  }
+  const reportedViewMs =
+    typeof body.reportedViewMs === "number" && Number.isFinite(body.reportedViewMs)
+      ? Math.floor(body.reportedViewMs)
+      : NaN;
+  if (!Number.isInteger(reportedViewMs) || reportedViewMs < 0) {
+    throw new ValidationError("reportedViewMs must be a non-negative integer.");
+  }
+
+  const result = await qualifyAndSettlePg({
+    impressionId,
+    userId,
+    reportedViewMs,
+  });
+
+  if (!result.ok) {
+    const status =
+      result.reason === "view_below_threshold" ||
+      result.reason === "wait_below_threshold"
+        ? 403
+        : 400;
+    res.status(status).json({ success: false, message: result.reason });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    duplicate: result.duplicate,
+    data: {
+      impressionId: result.impressionId,
+      house: result.house,
+      grossMicropaise: result.grossMicropaise,
+      userShareMicropaise: result.userShareMicropaise,
+      omniShareMicropaise: result.omniShareMicropaise,
+      availableMicropaise: result.availableMicropaise,
+    },
+  });
+}));
+
+app.get("/api/v1/exchange/wallet/:userId", safeRoute(async (req, res) => {
+  const userId = parseUserId(req.params.userId);
+  const wallet = await getWalletPg(userId);
+  res.status(200).json({
+    success: true,
+    data: wallet,
+  });
+}));
+
+app.post("/api/v1/telemetry", safeRoute(async (req, res) => {
+  const body = req.body as {
+    host?: unknown;
+    event?: unknown;
+    userId?: unknown;
+  };
+  const host = typeof body.host === "string" ? body.host.trim() : "";
+  if (!host || host.length > 128) {
+    throw new ValidationError("host is required (max 128 chars).");
+  }
+  const userId = parseUserId(body.userId);
+  const event = typeof body.event === "string" ? body.event.trim() : "";
+  const result = await recordPlatformEventPg(userId, host, event);
+  if (!result.ok) {
+    res.status(400).json({ success: false, message: "Invalid telemetry event." });
+    return;
+  }
+  res.status(200).json({ success: true });
+}));
+
+/** Fixed-reward yield is retired. Cannot mint money. */
+app.post("/api/v1/yield", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message:
+      "POST /api/v1/yield is retired. Use wait session → ad request → impression/qualify settlement.",
+  });
 });
 
 app.get("/api/v1/balance/:userId", safeRoute((req, res) => {
@@ -935,72 +871,103 @@ app.post("/api/v1/ad/event", (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/v1/campaigns", (req: Request, res: Response) => {
-  try {
-    const body = req.body as CreateCampaignRequestBody;
+app.post("/api/v1/campaigns", safeRoute(async (req, res) => {
+  const body = req.body as CreateCampaignRequestBody & {
+    cpm_micropaise?: unknown;
+    total_budget_micropaise?: unknown;
+    provider_key?: unknown;
+  };
 
-    const parsePositiveIntField = (value: unknown, field: string): number => {
-      const n =
-        typeof value === "number"
-          ? value
-          : typeof value === "string"
-            ? Number(value)
-            : NaN;
-      if (!Number.isInteger(n) || n <= 0) {
-        throw new ValidationError(`${field} must be a positive integer.`);
-      }
-      return n;
-    };
+  const parsePositiveIntField = (value: unknown, field: string): number => {
+    const n =
+      typeof value === "number"
+        ? value
+        : typeof value === "string"
+          ? Number(value)
+          : NaN;
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new ValidationError(`${field} must be a positive integer.`);
+    }
+    return n;
+  };
 
-    const advertiserEmail =
-      typeof body.advertiser_email === "string" ? body.advertiser_email : "";
-    const advertiser = getOrCreateAdvertiser(advertiserEmail);
+  const advertiserEmail =
+    typeof body.advertiser_email === "string" ? body.advertiser_email : "";
+  const advertiser = getOrCreateAdvertiser(advertiserEmail);
+  const headline = typeof body.headline === "string" ? body.headline : "";
+  const campaignBody = typeof body.body === "string" ? body.body : "";
+  const ctaLabel = typeof body.cta_label === "string" ? body.cta_label : "";
+  const ctaUrl = typeof body.cta_url === "string" ? body.cta_url : "";
+  const providerKey =
+    body.provider_key === "seed_sponsor" ? "seed_sponsor" : "omni_direct";
 
-    const campaign = createCampaign({
-      advertiser_email: advertiser.email,
-      headline: typeof body.headline === "string" ? body.headline : "",
-      body: typeof body.body === "string" ? body.body : "",
-      cta_label: typeof body.cta_label === "string" ? body.cta_label : "",
-      cta_url: typeof body.cta_url === "string" ? body.cta_url : "",
-      cpm_paise: parsePositiveIntField(body.cpm_paise, "cpm_paise"),
-      total_budget_paise: parsePositiveIntField(
+  let campaignId: string;
+  let cpmMicropaise: number;
+  let totalBudgetMicropaise: number;
+  let status: string;
+
+  if (
+    body.cpm_micropaise !== undefined ||
+    body.total_budget_micropaise !== undefined
+  ) {
+    cpmMicropaise = parsePositiveIntField(body.cpm_micropaise, "cpm_micropaise");
+    totalBudgetMicropaise = parsePositiveIntField(
+      body.total_budget_micropaise,
+      "total_budget_micropaise",
+    );
+    const created = await createFundedCampaignPg({
+      advertiserEmail: advertiser.email,
+      name: headline.slice(0, 80) || "Campaign",
+      providerKey,
+      cpmMicropaise,
+      totalBudgetMicropaise,
+      headline,
+      body: campaignBody,
+      ctaLabel,
+      ctaUrl,
+      status: "pending_review",
+    });
+    campaignId = created.campaignId;
+    status = "pending_review";
+  } else {
+    const created = await createCampaignFromPaiseInput({
+      advertiserEmail: advertiser.email,
+      headline,
+      body: campaignBody,
+      ctaLabel,
+      ctaUrl,
+      cpmPaise: parsePositiveIntField(body.cpm_paise, "cpm_paise"),
+      totalBudgetPaise: parsePositiveIntField(
         body.total_budget_paise,
         "total_budget_paise",
       ),
+      providerKey,
     });
-
-    const data: Record<string, unknown> = {
-      id: campaign.id,
-      status: campaign.status,
-      note: "Campaign submitted for manual review. It will go live after an admin approves it.",
-    };
-
-    if (advertiser.isNew) {
-      data.mgmt_key = advertiser.mgmt_key;
-      data.mgmt_key_note =
-        "Save this management key now — it is shown only once. You will need it to log in at /advertiser.";
-    }
-
-    res.status(201).json({
-      success: true,
-      data,
-    });
-  } catch (error) {
-    if (error instanceof ValidationError || error instanceof ContentValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Campaigns] Create error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
+    campaignId = created.campaignId;
+    cpmMicropaise = created.cpmMicropaise;
+    totalBudgetMicropaise = created.totalBudgetMicropaise;
+    status = "pending_review";
   }
-});
+
+  const data: Record<string, unknown> = {
+    id: campaignId,
+    status,
+    cpm_micropaise: cpmMicropaise,
+    total_budget_micropaise: totalBudgetMicropaise,
+    note: "Campaign stored in Postgres (micropaise). Pending review before activation.",
+  };
+
+  if (advertiser.isNew) {
+    data.mgmt_key = advertiser.mgmt_key;
+    data.mgmt_key_note =
+      "Save this management key now — it is shown only once. You will need it to log in at /advertiser.";
+  }
+
+  res.status(201).json({
+    success: true,
+    data,
+  });
+}));
 
 app.get("/api/v1/campaigns/stats", safeRoute((req, res) => {
   const auth = requireAdvertiser(req, res);
@@ -1180,82 +1147,113 @@ app.post(
   },
 );
 
-app.post("/api/v1/redeem", (req: Request, res: Response) => {
-  try {
-    const body = req.body as RedeemRequestBody;
-    const userId = parseUserId(body.userId);
-    const method = parseRedemptionMethod(body.method);
-    const detail = parseRedemptionDetail(method, body.detail);
+app.post("/api/v1/redeem", safeRoute(async (req, res) => {
+  const body = req.body as RedeemRequestBody;
+  const userId = parseUserId(body.userId);
+  const method = parseRedemptionMethod(body.method);
+  const detail = parseRedemptionDetail(method, body.detail);
 
-    const result = requestRedemption(
-      userId,
-      method,
-      detail,
-      REWARD_ECONOMICS.minRedemption,
-    );
-
-    if (!result.ok) {
-      if (result.reason === "below_minimum") {
-        res.status(400).json({
-          success: false,
-          reason: "below_minimum",
-          message: `Balance is below the minimum redemption amount (${REWARD_ECONOMICS.symbol}${REWARD_ECONOMICS.minRedemption}).`,
-        });
-        return;
-      }
-
-      res.status(400).json({
-        success: false,
-        reason: "already_pending",
-        message: "You already have a pending redemption request.",
-      });
-      return;
-    }
-
-    res.status(200).json({
-      success: true,
-      data: { amount: result.amount },
-    });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Redeem] Unexpected error", error);
-    res.status(500).json({
+  const wallet = await getWalletPg(userId);
+  const minMicropaise = REWARD_ECONOMICS.minRedemption * 100 * 1000; // ₹ → micropaise
+  if (wallet.availableMicropaise < minMicropaise) {
+    res.status(400).json({
       success: false,
-      message: "Internal server error.",
+      reason: "below_minimum",
+      message: `Balance is below the minimum redemption amount (${REWARD_ECONOMICS.symbol}${REWARD_ECONOMICS.minRedemption}).`,
     });
+    return;
   }
-});
 
-app.get("/api/v1/redemptions/:userId", (req: Request, res: Response) => {
-  try {
-    const userId = parseUserId(req.params.userId);
-    res.status(200).json({
-      success: true,
-      data: { redemptions: getUserRedemptions(userId) },
+  const amountMicropaise = wallet.availableMicropaise;
+  const result = await requestRedemptionPg({
+    userId,
+    amountMicropaise,
+    method,
+    detail,
+  });
+
+  if (!result.ok) {
+    res.status(400).json({
+      success: false,
+      reason: result.reason,
+      message: result.reason,
     });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
+    return;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      amount: amountMicropaise / 100_000,
+      amountMicropaise,
+      redemptionId: result.redemptionId,
+    },
+  });
+}));
+
+app.get("/api/v1/redemptions/:userId", safeRoute(async (req, res) => {
+  const userId = parseUserId(req.params.userId);
+  res.status(200).json({
+    success: true,
+    data: { redemptions: await listUserRedemptionsPg(userId) },
+  });
+}));
+
+app.get("/api/v1/admin/platforms", requireAdminKey, safeRoute(async (_req, res) => {
+  res.status(200).json({
+    success: true,
+    data: await getPlatformHealthPg(),
+  });
+}));
+
+app.post("/api/v1/admin/funding", requireAdminKey, safeRoute(async (req, res) => {
+  const body = req.body as {
+    advertiser_email?: unknown;
+    amount_micropaise?: unknown;
+    idempotency_key?: unknown;
+  };
+  const email =
+    typeof body.advertiser_email === "string" ? body.advertiser_email.trim() : "";
+  if (!email) {
+    throw new ValidationError("advertiser_email is required.");
+  }
+  const amount =
+    typeof body.amount_micropaise === "number" ? body.amount_micropaise : NaN;
+  const key =
+    typeof body.idempotency_key === "string" && body.idempotency_key.trim()
+      ? body.idempotency_key.trim()
+      : `funding:${email}:${amount}:${Date.now()}`;
+  const result = await confirmAdvertiserFundingPg({
+    advertiserEmail: email,
+    amountMicropaise: amount,
+    idempotencyKey: key,
+  });
+  if (!result.ok) {
+    res.status(400).json({ success: false, message: result.reason });
+    return;
+  }
+  res.status(200).json({ success: true, data: result });
+}));
+
+app.post(
+  "/api/v1/admin/campaigns/:id/provider",
+  requireAdminKey,
+  safeRoute(async (req, res) => {
+    const id =
+      typeof req.params.id === "string" ? req.params.id.trim() : "";
+    const providerKey =
+      typeof req.body?.provider_key === "string" ? req.body.provider_key.trim() : "";
+    if (!id || !providerKey) {
+      res.status(400).json({ success: false, message: "Invalid campaign or provider." });
       return;
     }
-
-    console.error("[Omni Redemptions] Unexpected error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
+    const ok = await setCampaignProviderPg(id, providerKey);
+    res.status(ok ? 200 : 404).json({
+      success: ok,
+      message: ok ? "Provider updated." : "Campaign or provider not found.",
     });
-  }
-});
+  }),
+);
 
 app.get("/api/v1/admin/stats", requireAdminKey, safeRoute((_req, res) => {
   res.status(200).json({
@@ -1285,64 +1283,49 @@ app.get("/api/v1/admin/ads", requireAdminKey, safeRoute((_req, res) => {
   });
 }));
 
-app.get("/api/v1/admin/campaigns", requireAdminKey, safeRoute((_req, res) => {
+app.get("/api/v1/admin/campaigns", requireAdminKey, safeRoute(async (_req, res) => {
   res.status(200).json({
     success: true,
-    data: { campaigns: getAllCampaignsAdmin() },
+    data: { campaigns: await listCampaignsAdminPg() },
   });
 }));
 
 app.post(
   "/api/v1/admin/campaigns/:id/review",
   requireAdminKey,
-  (req: Request, res: Response) => {
-    try {
-      const id = parsePositiveInt(req.params.id, "id");
-      const decisionRaw = (req.body as ReviewCampaignBody).decision;
-      const decision =
-        typeof decisionRaw === "string" ? decisionRaw.trim() : "";
-
-      if (decision !== "approve" && decision !== "reject") {
-        throw new ValidationError("decision must be 'approve' or 'reject'.");
-      }
-
-      const result = reviewCampaign(id, decision);
-
-      if (!result.ok) {
-        const message =
-          result.reason === "not_found"
-            ? "Campaign not found."
-            : result.reason === "not_pending"
-              ? "Campaign is not pending review."
-              : "Invalid review decision.";
-
-        res.status(result.reason === "not_found" ? 404 : 400).json({
-          success: false,
-          message,
-        });
-        return;
-      }
-
-      res.status(200).json({
-        success: true,
-        data: { id, status: result.status },
-      });
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-        });
-        return;
-      }
-
-      console.error("[Omni Admin] Review campaign error", error);
-      res.status(500).json({
-        success: false,
-        message: "Internal server error.",
-      });
+  safeRoute(async (req, res) => {
+    const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!id) {
+      throw new ValidationError("campaign id is required.");
     }
-  },
+    const decisionRaw = (req.body as ReviewCampaignBody).decision;
+    const decision =
+      typeof decisionRaw === "string" ? decisionRaw.trim() : "";
+
+    if (decision !== "approve" && decision !== "reject") {
+      throw new ValidationError("decision must be 'approve' or 'reject'.");
+    }
+
+    const result = await reviewCampaignPg(id, decision);
+
+    if (!result.ok) {
+      const message =
+        result.reason === "not_found"
+          ? "Campaign not found."
+          : "Campaign is not pending review.";
+
+      res.status(result.reason === "not_found" ? 404 : 400).json({
+        success: false,
+        message,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: { id, status: result.status },
+    });
+  }),
 );
 
 app.get("/api/v1/admin/topups", requireAdminKey, safeRoute((_req, res) => {
@@ -3431,7 +3414,9 @@ app.use(
 
 app.listen(PORT, "0.0.0.0", () => {
   console.info(`[Omni Backend] Server listening on http://localhost:${PORT}`);
-  console.info(`[Omni Backend] Yield endpoint: POST http://localhost:${PORT}/api/v1/yield`);
+  console.info(
+    `[Omni Backend] Exchange: POST /api/v1/ad/request + /api/v1/impression/qualify`,
+  );
 });
 
 process.on("uncaughtException", (error) => {

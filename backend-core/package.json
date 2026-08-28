@@ -11,9 +11,13 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke-test.ts",
-    "test:money": "tsx ../shared/money/micropaise.test.ts"
+    "test:money": "tsx ../shared/money/micropaise.test.ts",
+    "test:exchange": "tsx scripts/exchange-postgres-test.ts",
+    "test:exchange:pg": "tsx scripts/exchange-postgres-test.ts",
+    "test:rls": "tsx scripts/rls-probe.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
     "better-sqlite3": "^12.11.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
