@@ -16,7 +16,8 @@ import { WaitStateMachine } from "./state-machine";
 import { ViewabilityTracker } from "./viewability";
 
 const SPONSORED_WAITS_KEY = "sponsoredWaitsEnabled";
-const SHORT_WAIT_MS = 2500;
+/** UI-only: minimum time before fading shell if generation ends early (not financial authority). */
+const MIN_SPONSORED_UI_DISPLAY_MS = 2500;
 const SHELL_EXPAND_MS = 1200;
 
 const FALLBACK_CONFIG: PlatformConfig = {
@@ -112,12 +113,18 @@ export class WaitController {
     return {
       hostname: this.hostname,
       adapter: this.adapter?.id ?? null,
+      platform: this.adapter?.platformKey ?? null,
       state: this.sm.getState(),
       cycleId: this.sm.getCycleId(),
       platformEnabled: this.platformEnabled,
       session: this.session?.waitSessionId ?? null,
+      sessionStatus: this.session ? "active" : null,
       impressionId: this.ad?.impressionId ?? null,
+      adSource: this.ad?.source ?? null,
+      adStatus: this.ad ? "loaded" : this.ui ? "shell" : null,
       uiMounted: Boolean(this.ui),
+      qualifySent: this.qualifySent,
+      viewability: this.viewability.getSnapshot(),
       extensionValid: isExtensionContextValid(),
     };
   }
@@ -379,7 +386,7 @@ export class WaitController {
 
     const elapsed = Date.now() - this.generationStartedAt;
     if (
-      elapsed < SHORT_WAIT_MS ||
+      elapsed < MIN_SPONSORED_UI_DISPLAY_MS ||
       (this.sm.getState() === "VIEWABILITY_PENDING" && !this.qualifySent)
     ) {
       this.sm.transition("SHORT_WAIT");

@@ -21,3 +21,10 @@ export function formatMicropaiseDisplay(
 export function micropaiseToRupees(micropaise: number): number {
   return Math.max(0, micropaise) / 100_000;
 }
+
+/** Clamp advertiser copy for safe card layout. */
+export function truncateText(text: string, maxLen: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return `${trimmed.slice(0, maxLen - 1).trimEnd()}…`;
+}

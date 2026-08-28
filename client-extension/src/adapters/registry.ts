@@ -82,15 +82,29 @@ function walkAnchorFromIndicator(
   return null;
 }
 
+function findComposerAnchor(selectors: string[]): HTMLElement | null {
+  for (const sel of selectors) {
+    const el = document.querySelector<HTMLElement>(sel);
+    if (!el || !isVisible(el)) continue;
+    const form = el.closest("form");
+    if (form?.parentElement) return form;
+    if (el.parentElement) return el.parentElement;
+  }
+  return null;
+}
+
 function createAdapter(def: {
   id: string;
   name: string;
   hostnamePatterns: string[];
   platformKey: string;
   generationSelectors: string[];
+  composerSelectors?: string[];
   extraActiveCheck?: () => boolean;
+  anchorStrategy?: "composer" | "indicator";
 }): AiSiteAdapter {
   const allSelectors = [...def.generationSelectors, ...GENERIC_STOP_SELECTORS];
+  const anchorStrategy = def.anchorStrategy ?? "indicator";
 
   return {
     id: def.id,
@@ -127,8 +141,18 @@ function createAdapter(def: {
     },
 
     findPreferredAdAnchor(): HTMLElement | null {
+      if (anchorStrategy === "composer" && def.composerSelectors) {
+        const composer = findComposerAnchor(def.composerSelectors);
+        if (composer) return composer;
+      }
+
       const indicator = queryFirst(def.generationSelectors);
-      if (!indicator) return null;
+      if (!indicator) {
+        if (def.composerSelectors) {
+          return findComposerAnchor(def.composerSelectors);
+        }
+        return null;
+      }
       return walkAnchorFromIndicator(indicator);
     },
 
@@ -157,6 +181,13 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     name: "ChatGPT",
     hostnamePatterns: ["chatgpt.com"],
     platformKey: "chatgpt.com",
+    anchorStrategy: "composer",
+    composerSelectors: [
+      "#prompt-textarea",
+      '[data-testid="composer-background"]',
+      'textarea[placeholder*="Message"]',
+      'form:has(textarea)',
+    ],
     generationSelectors: [
       '[data-testid="stop-button"]',
       '[aria-label="Stop generating"]',
@@ -168,6 +199,12 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     name: "Claude",
     hostnamePatterns: ["claude.ai"],
     platformKey: "claude.ai",
+    anchorStrategy: "composer",
+    composerSelectors: [
+      '[data-testid="chat-input"]',
+      'div[contenteditable="true"]',
+      'fieldset',
+    ],
     generationSelectors: [
       'button[aria-label="Stop streaming"]',
       '[aria-label*="Stop"]',
@@ -178,6 +215,12 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     name: "Gemini",
     hostnamePatterns: ["gemini.google.com"],
     platformKey: "gemini.google.com",
+    anchorStrategy: "composer",
+    composerSelectors: [
+      'rich-textarea',
+      '[aria-label*="Enter a prompt"]',
+      'textarea',
+    ],
     generationSelectors: [
       'button[aria-label*="Stop"]',
       'button[aria-label*="Cancel"]',
@@ -219,6 +262,12 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     name: "Grok",
     hostnamePatterns: ["grok.com"],
     platformKey: "grok.com",
+    anchorStrategy: "composer",
+    composerSelectors: [
+      'textarea',
+      '[contenteditable="true"]',
+      'form',
+    ],
     generationSelectors: ['[aria-label*="Stop"]', '[data-testid*="stop"]'],
   }),
   createAdapter({

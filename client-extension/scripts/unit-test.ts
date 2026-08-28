@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { WaitStateMachine } from "../src/content/state-machine";
-import { formatMicropaiseDisplay } from "../src/shared/format";
+import { formatMicropaiseDisplay, truncateText } from "../src/shared/format";
 
 const sm = new WaitStateMachine();
 assert.equal(sm.getState(), "IDLE");
@@ -20,5 +20,7 @@ assert.equal(sm.getState(), "IDLE");
 assert.equal(formatMicropaiseDisplay(600), "0.6p");
 assert.equal(formatMicropaiseDisplay(100_000), "₹1");
 assert.equal(formatMicropaiseDisplay(0), "₹0");
+assert.equal(truncateText("hello world", 20), "hello world");
+assert.equal(truncateText("abcdefghijklmnopqrstuvwxyz", 10), "abcdefghi…");
 
 console.log("PASS: extension unit tests (state machine + format)");

@@ -34,6 +34,8 @@ export interface AdCreative {
   body: string;
   cta_label: string;
   cta_url: string;
+  logo_url?: string;
+  advertiser_name?: string;
 }
 
 export interface WaitAdData {
