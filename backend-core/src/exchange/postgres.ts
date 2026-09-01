@@ -10,6 +10,8 @@ import {
 } from "../money/micropaise.js";
 import { getExchangeConfig } from "./config.js";
 import { getProviderPolicy, isCashPayingProvider } from "./providers.js";
+import { classifySupabaseFailure, ExchangeError } from "./errors.js";
+import { canonicalizeInventoryPlatform } from "./platforms.js";
 import { getServiceSupabase } from "./supabaseClient.js";
 
 export type CreativePayload = {
@@ -17,6 +19,7 @@ export type CreativePayload = {
   body: string;
   cta_label: string;
   cta_url: string;
+  advertiser_name?: string;
 };
 
 export type WaitSessionRow = {
@@ -29,8 +32,8 @@ export type WaitSessionRow = {
 };
 
 const HOUSE_CREATIVE: CreativePayload = {
-  headline: "Omni — Earn from AI wait time",
-  body: "Sponsored waits share advertiser revenue. No fixed rewards.",
+  headline: "Omni",
+  body: "A short pause while your answer writes.",
   cta_label: "Learn more",
   cta_url: "https://portfoliobuilders.in",
 };
@@ -58,7 +61,12 @@ async function ensureProfileAndInstallation(userId: string): Promise<{
   profileId: string;
   installationId: string;
 }> {
-  const sb = getServiceSupabase();
+  let sb;
+  try {
+    sb = getServiceSupabase();
+  } catch (error) {
+    throw classifySupabaseFailure("profile", error);
+  }
   const profileId = profileIdFromUserId(userId);
 
   const { error: profileErr } = await sb.from("profiles").upsert(
@@ -66,14 +74,18 @@ async function ensureProfileAndInstallation(userId: string): Promise<{
     { onConflict: "id" },
   );
   if (profileErr) {
-    throw new Error(`profile_upsert_failed: ${profileErr.message}`);
+    throw classifySupabaseFailure("profile", profileErr);
   }
 
-  const { data: existing } = await sb
+  const { data: existing, error: existingErr } = await sb
     .from("installations")
     .select("id")
     .eq("extension_install_id", profileId)
     .maybeSingle();
+
+  if (existingErr) {
+    throw classifySupabaseFailure("installation", existingErr);
+  }
 
   if (existing?.id) {
     return { profileId, installationId: existing.id as string };
@@ -90,7 +102,7 @@ async function ensureProfileAndInstallation(userId: string): Promise<{
     .single();
 
   if (error || !created) {
-    throw new Error(`installation_create_failed: ${error?.message}`);
+    throw classifySupabaseFailure("installation", error ?? new Error("installation_create_failed"));
   }
   return { profileId, installationId: created.id as string };
 }
@@ -99,8 +111,34 @@ export async function startWaitSessionPg(
   userId: string,
   platform: string,
 ): Promise<WaitSessionRow> {
-  const sb = getServiceSupabase();
-  const { profileId, installationId } = await ensureProfileAndInstallation(userId);
+  const inventoryKey = canonicalizeInventoryPlatform(platform);
+  if (!inventoryKey) {
+    throw new ExchangeError(
+      "INVALID_PLATFORM",
+      "platform must be a supported wait-inventory surface.",
+    );
+  }
+
+  let sb;
+  try {
+    sb = getServiceSupabase();
+  } catch (error) {
+    throw classifySupabaseFailure("wait_session", error);
+  }
+
+  await expireStaleExchangeRowsPg().catch(() => undefined);
+
+  let profileId: string;
+  let installationId: string;
+  try {
+    const ensured = await ensureProfileAndInstallation(userId);
+    profileId = ensured.profileId;
+    installationId = ensured.installationId;
+  } catch (error) {
+    if (error instanceof ExchangeError) throw error;
+    throw classifySupabaseFailure("profile", error);
+  }
+
   const serverNonce = randomUUID();
 
   const { data, error } = await sb
@@ -108,7 +146,7 @@ export async function startWaitSessionPg(
     .insert({
       installation_id: installationId,
       profile_id: profileId,
-      platform: platform.slice(0, 64) || "unknown",
+      platform: inventoryKey,
       status: "open",
       server_nonce: serverNonce,
       started_at: new Date().toISOString(),
@@ -117,7 +155,7 @@ export async function startWaitSessionPg(
     .single();
 
   if (error || !data) {
-    throw new Error(`wait_session_failed: ${error?.message}`);
+    throw classifySupabaseFailure("wait_session", error ?? new Error("wait_session_failed"));
   }
 
   return data as WaitSessionRow;
@@ -164,9 +202,13 @@ async function settledTodayForProfile(
 async function pickPaidCampaign(
   profileId: string,
   preferredProvider?: string,
+  opts?: { restrictToCampaignIds?: string[] },
 ): Promise<(CampaignRow & { creative: CreativePayload }) | null> {
   const sb = getServiceSupabase();
   const cfg = getExchangeConfig();
+  const allowed = opts?.restrictToCampaignIds;
+  if (allowed && allowed.length === 0) return null;
+
   const priority = preferredProvider
     ? [
         preferredProvider,
@@ -182,7 +224,7 @@ async function pickPaidCampaign(
     const policy = getProviderPolicy(providerKey);
     if (!policy?.enabled || !policy.cashRevenueShareAllowed) continue;
 
-    const { data: campaigns } = await sb
+    let query = sb
       .from("campaigns")
       .select(
         "id, advertiser_id, provider_key, cpm_micropaise, total_budget_micropaise, spent_micropaise, status, starts_at, ends_at",
@@ -190,6 +232,8 @@ async function pickPaidCampaign(
       .eq("status", "active")
       .eq("provider_key", providerKey)
       .order("cpm_micropaise", { ascending: false });
+    if (allowed) query = query.in("id", allowed);
+    const { data: campaigns } = await query;
 
     for (const raw of campaigns ?? []) {
       const c = raw as CampaignRow;
@@ -213,6 +257,14 @@ async function pickPaidCampaign(
 
       if (!creative?.headline || !creative.cta_url) continue;
 
+      const { data: advertiser } = await sb
+        .from("advertisers")
+        .select("name")
+        .eq("id", c.advertiser_id)
+        .maybeSingle();
+      const advertiserName =
+        typeof advertiser?.name === "string" ? advertiser.name.trim() : "";
+
       return {
         ...c,
         creative: {
@@ -220,6 +272,7 @@ async function pickPaidCampaign(
           body: (creative.description as string) ?? "",
           cta_label: (creative.cta_label as string) ?? "Learn more",
           cta_url: creative.cta_url as string,
+          advertiser_name: advertiserName || undefined,
         },
       };
     }
@@ -245,6 +298,10 @@ export async function createAdRequestPg(input: {
   waitSessionId: string;
   userId: string;
   preferredProvider?: string;
+  /** Test-only. Never accepted from HTTP. */
+  forceHouse?: boolean;
+  /** Test-only: consider only these campaign ids. Never accepted from HTTP. */
+  restrictToCampaignIds?: string[];
 }): Promise<AdRequestPgResult> {
   const sb = getServiceSupabase();
   const profileId = profileIdFromUserId(input.userId);
@@ -261,7 +318,12 @@ export async function createAdRequestPg(input: {
   if (session.status !== "open") return { ok: false, reason: "session_closed" };
 
   const { installationId } = await ensureProfileAndInstallation(input.userId);
-  const paid = await pickPaidCampaign(profileId, input.preferredProvider);
+  await expireStaleExchangeRowsPg().catch(() => undefined);
+  const paid = input.forceHouse
+    ? null
+    : await pickPaidCampaign(profileId, input.preferredProvider, {
+        restrictToCampaignIds: input.restrictToCampaignIds,
+      });
 
   if (!paid) {
     const { data: adReq, error: arErr } = await sb
@@ -400,6 +462,9 @@ export async function qualifyAndSettlePg(input: {
     .maybeSingle();
 
   if (impErr || !imp) return { ok: false, reason: "impression_not_found" };
+  if (imp.status === "expired" || imp.status === "cancelled" || imp.status === "rejected") {
+    return { ok: false, reason: "impression_closed" };
+  }
 
   const { data: session } = await sb
     .from("wait_sessions")
@@ -993,4 +1058,129 @@ export async function backdateWaitSessionPg(
     .from("wait_sessions")
     .update({ started_at: startedAtIso })
     .eq("id", waitSessionId);
+}
+
+const DEFAULT_STALE_AGE_SECONDS = 1800;
+
+export async function expireStaleExchangeRowsPg(
+  maxAgeSeconds: number = DEFAULT_STALE_AGE_SECONDS,
+): Promise<{ expiredImpressions: number; expiredSessions: number }> {
+  const sb = getServiceSupabase();
+  const { data, error } = await sb.rpc("expire_stale_exchange_rows", {
+    p_max_age_seconds: maxAgeSeconds,
+  });
+  if (error) throw new Error(error.message);
+  const row = data as {
+    expired_impressions?: number;
+    expired_sessions?: number;
+  } | null;
+  return {
+    expiredImpressions: Number(row?.expired_impressions ?? 0),
+    expiredSessions: Number(row?.expired_sessions ?? 0),
+  };
+}
+
+/** Close a wait session and expire any unpaid pending impression for it. */
+export async function endWaitSessionPg(
+  waitSessionId: string,
+  userId: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const sb = getServiceSupabase();
+  const profileId = profileIdFromUserId(userId);
+  const { data: session } = await sb
+    .from("wait_sessions")
+    .select("id, profile_id, status")
+    .eq("id", waitSessionId)
+    .maybeSingle();
+  if (!session?.id) return { ok: false, reason: "not_found" };
+  if (session.profile_id !== profileId) return { ok: false, reason: "user_mismatch" };
+
+  await sb
+    .from("impressions")
+    .update({ status: "expired", financial_status: "none" })
+    .eq("wait_session_id", waitSessionId)
+    .eq("status", "pending");
+
+  if (session.status === "open") {
+    await sb
+      .from("wait_sessions")
+      .update({
+        status: "completed",
+        ended_at: new Date().toISOString(),
+      })
+      .eq("id", waitSessionId)
+      .eq("status", "open");
+  }
+  return { ok: true };
+}
+
+export async function recordImpressionClickPg(
+  impressionId: string,
+  userId: string,
+): Promise<{ ok: true; duplicate: boolean } | { ok: false; reason: string }> {
+  const sb = getServiceSupabase();
+  const profileId = profileIdFromUserId(userId);
+  const { data: imp } = await sb
+    .from("impressions")
+    .select("id, wait_session_id")
+    .eq("id", impressionId)
+    .maybeSingle();
+  if (!imp?.id) return { ok: false, reason: "not_found" };
+  const { data: session } = await sb
+    .from("wait_sessions")
+    .select("profile_id")
+    .eq("id", imp.wait_session_id as string)
+    .maybeSingle();
+  if (!session || session.profile_id !== profileId) {
+    return { ok: false, reason: "user_mismatch" };
+  }
+  const { data: existing } = await sb
+    .from("clicks")
+    .select("id")
+    .eq("impression_id", impressionId)
+    .limit(1)
+    .maybeSingle();
+  if (existing?.id) return { ok: true, duplicate: true };
+  const { error } = await sb.from("clicks").insert({ impression_id: impressionId });
+  if (error) return { ok: false, reason: error.message };
+  return { ok: true, duplicate: false };
+}
+
+type PlatformFlagMap = Record<
+  string,
+  { enabled?: boolean; sponsoredWaitEnabled?: boolean }
+>;
+
+export async function getInventoryPlatformFlagsPg(): Promise<PlatformFlagMap> {
+  const sb = getServiceSupabase();
+  const { data } = await sb
+    .from("app_config")
+    .select("value")
+    .eq("key", "inventory_platform_flags")
+    .maybeSingle();
+  const value = data?.value;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as PlatformFlagMap;
+  }
+  return {};
+}
+
+export async function setSponsoredWaitEnabledPg(
+  adapterId: string,
+  enabled: boolean,
+): Promise<void> {
+  const sb = getServiceSupabase();
+  const flags = await getInventoryPlatformFlagsPg();
+  flags[adapterId] = {
+    ...(flags[adapterId] ?? {}),
+    sponsoredWaitEnabled: enabled,
+  };
+  await sb.from("app_config").upsert(
+    {
+      key: "inventory_platform_flags",
+      value: flags,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "key" },
+  );
 }

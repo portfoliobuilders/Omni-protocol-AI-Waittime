@@ -102,6 +102,10 @@ export function parseAdRequest(data: unknown): WaitAdData | null {
   ) {
     return null;
   }
+  const advertiserName =
+    typeof creative.advertiser_name === "string"
+      ? creative.advertiser_name.trim()
+      : "";
   return {
     adRequestId: String(payload.adRequestId ?? ""),
     impressionId: payload.impressionId,
@@ -109,7 +113,15 @@ export function parseAdRequest(data: unknown): WaitAdData | null {
     source: payload.source === "paid_campaign" ? "paid_campaign" : "house",
     campaignId:
       typeof payload.campaignId === "string" ? payload.campaignId : null,
-    creative,
+    creative: {
+      headline: String(creative.headline),
+      body: String(creative.body ?? ""),
+      cta_label: String(creative.cta_label ?? "Learn more"),
+      cta_url: String(creative.cta_url),
+      logo_url:
+        typeof creative.logo_url === "string" ? creative.logo_url : undefined,
+      advertiser_name: advertiserName || undefined,
+    },
     requiredViewMs: Number(payload.requiredViewMs ?? 5000),
     cashRevenueShareAllowed: Boolean(payload.cashRevenueShareAllowed),
     sponsoredLabel: String(payload.sponsoredLabel ?? "Sponsored"),

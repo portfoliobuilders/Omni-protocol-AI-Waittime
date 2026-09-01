@@ -46,21 +46,33 @@ import {
 } from "./db";
 import { getExchangeConfig } from "./exchange/config";
 import {
+  clientSafeExchangeMessage,
+  ExchangeError,
+  httpStatusForExchangeCode,
+  logExchangeError,
+} from "./exchange/errors";
+import { canonicalizeInventoryPlatform, extensionPlatformConfig } from "./exchange/platforms";
+import {
   backdateWaitSessionPg,
   confirmAdvertiserFundingPg,
   createAdRequestPg,
   createCampaignFromPaiseInput,
   createFundedCampaignPg,
+  endWaitSessionPg,
+  expireStaleExchangeRowsPg,
+  getInventoryPlatformFlagsPg,
   getPlatformHealthPg,
   getRecentEarningsPg,
   getWalletPg,
   listCampaignsAdminPg,
   listUserRedemptionsPg,
   qualifyAndSettlePg,
+  recordImpressionClickPg,
   recordPlatformEventPg,
   requestRedemptionPg,
   reviewCampaignPg,
   setCampaignProviderPg,
+  setSponsoredWaitEnabledPg,
   startWaitSessionPg,
 } from "./exchange/postgres";
 import { BUILTIN_PROVIDERS } from "./exchange/providers";
@@ -69,6 +81,7 @@ import { assertPostgresExchangeReady } from "./exchange/supabaseClient";
 // Keep typecheck happy for admin/test helpers re-exported via routes later.
 void createFundedCampaignPg;
 void backdateWaitSessionPg;
+void expireStaleExchangeRowsPg;
 
 dotenv.config();
 assertPostgresExchangeReady();
@@ -100,19 +113,7 @@ const REWARD_ECONOMICS = {
   },
 } as const;
 
-/** Remote platform toggles for extension (disable without release). */
-const EXTENSION_PLATFORMS = [
-  { id: "chatgpt", name: "ChatGPT", enabled: true, sponsoredWaitEnabled: true, hosts: ["chatgpt.com"] },
-  { id: "claude", name: "Claude", enabled: true, sponsoredWaitEnabled: true, hosts: ["claude.ai"] },
-  { id: "gemini", name: "Gemini", enabled: true, sponsoredWaitEnabled: true, hosts: ["gemini.google.com"] },
-  { id: "perplexity", name: "Perplexity", enabled: true, sponsoredWaitEnabled: true, hosts: ["perplexity.ai", "www.perplexity.ai"] },
-  { id: "copilot", name: "Copilot", enabled: true, sponsoredWaitEnabled: true, hosts: ["copilot.microsoft.com"] },
-  { id: "deepseek", name: "DeepSeek", enabled: true, sponsoredWaitEnabled: true, hosts: ["chat.deepseek.com"] },
-  { id: "grok", name: "Grok", enabled: true, sponsoredWaitEnabled: true, hosts: ["grok.com"] },
-  { id: "meta_ai", name: "Meta AI", enabled: true, sponsoredWaitEnabled: true, hosts: ["meta.ai", "www.meta.ai"] },
-  { id: "mistral", name: "Le Chat", enabled: true, sponsoredWaitEnabled: true, hosts: ["chat.mistral.ai"] },
-  { id: "poe", name: "Poe", enabled: true, sponsoredWaitEnabled: true, hosts: ["poe.com", "www.poe.com"] },
-] as const;
+/** Remote platform toggles are loaded from app_config per request. */
 
 // Changed fallback port from 3000 to 3001 to bypass the blocked port issue
 const PORT = Number(process.env.PORT ?? 3001);
@@ -166,11 +167,24 @@ const app = express();
 
 app.disable("x-powered-by");
 
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.headers["access-control-request-private-network"] === "true") {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+  }
+  next();
+});
+
 app.use(
   cors({
     origin: true,
     methods: ["GET", "POST", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Adv-Email", "X-Adv-Key"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Adv-Email",
+      "X-Adv-Key",
+      "Access-Control-Request-Private-Network",
+    ],
   }),
 );
 
@@ -264,6 +278,27 @@ function safeRoute(handler: RouteHandler): RouteHandler {
           success: false,
           message: error.message,
         });
+        return;
+      }
+
+      if (error instanceof ExchangeError) {
+        const body = req.body as { userId?: unknown; platform?: unknown };
+        logExchangeError(req.path, error, {
+          userId: typeof body?.userId === "string" ? body.userId : undefined,
+          platform: typeof body?.platform === "string" ? body.platform : undefined,
+        });
+        if (!res.headersSent) {
+          const status = httpStatusForExchangeCode(error.code);
+          res.status(status).json({
+            success: false,
+            error:
+              req.path === "/api/v1/session/start"
+                ? "session_start_failed"
+                : "exchange_failed",
+            code: error.code,
+            message: clientSafeExchangeMessage(error.code),
+          });
+        }
         return;
       }
 
@@ -466,8 +501,14 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-app.get("/api/v1/config", (_req: Request, res: Response) => {
+app.get("/api/v1/config", safeRoute(async (_req, res) => {
   const exchange = getExchangeConfig();
+  const flags = await getInventoryPlatformFlagsPg().catch(() => ({} as Record<string, { enabled?: boolean; sponsoredWaitEnabled?: boolean }>));
+  const platforms = extensionPlatformConfig().map((p) => ({
+    ...p,
+    enabled: flags[p.id]?.enabled ?? p.enabled,
+    sponsoredWaitEnabled: flags[p.id]?.sponsoredWaitEnabled ?? p.sponsoredWaitEnabled,
+  }));
   res.status(200).json({
     success: true,
     data: {
@@ -491,10 +532,10 @@ app.get("/api/v1/config", (_req: Request, res: Response) => {
         omniRevenueShareBps: exchange.omniRevenueShareBps,
         minimumQualifiedViewMs: exchange.minimumQualifiedViewMs,
       },
-      platforms: EXTENSION_PLATFORMS,
+      platforms,
     },
   });
-});
+}));
 
 app.get("/sdk/omni.min.js", (_req: Request, res: Response) => {
   const sdkPath = resolveOmniSdkPath();
@@ -579,11 +620,23 @@ app.post("/api/v1/session/start", safeRoute(async (req, res) => {
     return;
   }
 
-  const userId = parseUserId(body.userId);
-  const platform =
-    typeof body.platform === "string" && body.platform.trim()
-      ? body.platform.trim().slice(0, 64)
-      : "unknown";
+  let userId: string;
+  try {
+    userId = parseUserId(body.userId);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      throw new ExchangeError("INVALID_USER_ID", error.message);
+    }
+    throw error;
+  }
+
+  const platform = canonicalizeInventoryPlatform(body.platform);
+  if (!platform) {
+    throw new ExchangeError(
+      "INVALID_PLATFORM",
+      "platform must be a supported wait-inventory surface.",
+    );
+  }
 
   const sessionToken = createClaimSession(userId);
   const wait = await startWaitSessionPg(userId, platform);
@@ -597,6 +650,22 @@ app.post("/api/v1/session/start", safeRoute(async (req, res) => {
       startedAt: wait.started_at,
       platform: wait.platform,
     },
+  });
+}));
+
+app.post("/api/v1/session/end", safeRoute(async (req, res) => {
+  const body = req.body as { userId?: unknown; waitSessionId?: unknown };
+  const userId = parseUserId(body.userId);
+  const waitSessionId =
+    typeof body.waitSessionId === "string" ? body.waitSessionId.trim() : "";
+  if (!waitSessionId) {
+    res.status(200).json({ success: true, data: { ended: true, skipped: true } });
+    return;
+  }
+  const result = await endWaitSessionPg(waitSessionId, userId);
+  res.status(200).json({
+    success: true,
+    data: { ended: result.ok, reason: result.ok ? undefined : result.reason },
   });
 }));
 
@@ -734,6 +803,22 @@ app.post("/api/v1/impression/qualify", safeRoute(async (req, res) => {
       availableMicropaise: result.availableMicropaise,
     },
   });
+}));
+
+app.post("/api/v1/impression/click", safeRoute(async (req, res) => {
+  const body = req.body as { userId?: unknown; impressionId?: unknown };
+  const userId = parseUserId(body.userId);
+  const impressionId =
+    typeof body.impressionId === "string" ? body.impressionId.trim() : "";
+  if (!impressionId) {
+    throw new ValidationError("impressionId is required.");
+  }
+  const result = await recordImpressionClickPg(impressionId, userId);
+  if (!result.ok) {
+    res.status(400).json({ success: false, message: result.reason });
+    return;
+  }
+  res.status(200).json({ success: true, data: { duplicate: result.duplicate } });
 }));
 
 app.get("/api/v1/exchange/wallet/:userId", safeRoute(async (req, res) => {
@@ -1265,6 +1350,21 @@ app.get("/api/v1/admin/platforms", requireAdminKey, safeRoute(async (_req, res) 
     data: await getPlatformHealthPg(),
   });
 }));
+
+app.post(
+  "/api/v1/admin/platforms/:id/sponsored-wait",
+  requireAdminKey,
+  safeRoute(async (req, res) => {
+    const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    const enabled = req.body?.enabled !== false;
+    if (!id) {
+      res.status(400).json({ success: false, message: "platform id required" });
+      return;
+    }
+    await setSponsoredWaitEnabledPg(id, enabled);
+    res.status(200).json({ success: true, data: { id, sponsoredWaitEnabled: enabled } });
+  }),
+);
 
 app.post("/api/v1/admin/funding", requireAdminKey, safeRoute(async (req, res) => {
   const body = req.body as {

@@ -11,5 +11,9 @@ backend-core/data/
 .env.*
 !.env.example
 .supabase/
+supabase/.branches/
+supabase/.temp/
+.agents/
+skills-lock.json
 .cursor/
 .DS_Store

@@ -15,7 +15,9 @@ function boot(): void {
 (
   window as Window & { __omniPiggyProbe?: () => void }
 ).__omniPiggyProbe = () => {
-  console.log("[OmniPiggy] probe", controller?.probe() ?? "no controller");
+  const snapshot = controller?.probe() ?? "no controller";
+  console.log("[OmniPiggy] probe", snapshot);
+  return snapshot;
 };
 
 if (document.readyState === "loading") {

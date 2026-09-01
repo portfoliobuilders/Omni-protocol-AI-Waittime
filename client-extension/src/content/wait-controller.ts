@@ -11,7 +11,9 @@ import type {
   WaitAdData,
   WaitSessionData,
 } from "../shared/types";
+import { formatMicropaiseDisplay } from "../shared/format";
 import { OmniWaitAd } from "./omni-wait-ad";
+import { QualifyHandoff } from "./qualify-handoff";
 import { WaitStateMachine } from "./state-machine";
 import { ViewabilityTracker } from "./viewability";
 
@@ -38,7 +40,7 @@ export function isExtensionContextValid(): boolean {
   }
 }
 
-function sendMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
+function sendMessageOnce(message: BackgroundMessage): Promise<BackgroundResponse> {
   if (!isExtensionContextValid()) {
     return Promise.reject(new Error("Extension context invalidated"));
   }
@@ -58,6 +60,25 @@ function sendMessage(message: BackgroundMessage): Promise<BackgroundResponse> {
   });
 }
 
+function isTransientMessagingError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /message port closed|context invalidated|receiving end does not exist/i.test(
+    msg,
+  );
+}
+
+async function sendMessage(
+  message: BackgroundMessage,
+): Promise<BackgroundResponse> {
+  try {
+    return await sendMessageOnce(message);
+  } catch (error) {
+    if (!isTransientMessagingError(error)) throw error;
+    await new Promise((r) => setTimeout(r, 40));
+    return sendMessageOnce(message);
+  }
+}
+
 export class WaitController {
   private adapter: AiSiteAdapter | null;
   private sm = new WaitStateMachine();
@@ -72,9 +93,11 @@ export class WaitController {
   private ad: WaitAdData | null = null;
   private ui: OmniWaitAd | null = null;
   private viewability = new ViewabilityTracker();
-  private qualifySent = false;
+  private qualifyHandoff = new QualifyHandoff();
+  private qualifyCycleId = 0;
   private generationStartedAt = 0;
   private expandTimer: number | null = null;
+  private lastError: string | null = null;
 
   constructor(private hostname: string) {
     this.adapter = getAdapterForHost(hostname);
@@ -117,13 +140,30 @@ export class WaitController {
       state: this.sm.getState(),
       cycleId: this.sm.getCycleId(),
       platformEnabled: this.platformEnabled,
-      session: this.session?.waitSessionId ?? null,
+      session: this.session
+        ? {
+            waitSessionId: this.session.waitSessionId,
+            platform: this.session.platform,
+            startedAt: this.session.startedAt,
+          }
+        : null,
       sessionStatus: this.session ? "active" : null,
       impressionId: this.ad?.impressionId ?? null,
+      providerKey: this.ad?.providerKey ?? null,
       adSource: this.ad?.source ?? null,
       adStatus: this.ad ? "loaded" : this.ui ? "shell" : null,
       uiMounted: Boolean(this.ui),
-      qualifySent: this.qualifySent,
+      qualifySent: this.qualifyHandoff.hasQualifyBeenSent(),
+      thresholdReached: this.viewability.hasReachedThreshold(),
+      qualificationAccepted: this.qualifyHandoff.getSnapshot().qualificationAccepted,
+      settled: this.qualifyHandoff.getSnapshot().settled,
+      displayedEarning: this.qualifyHandoff.shouldDisplayEarning()
+        ? formatMicropaiseDisplay(
+            this.qualifyHandoff.getDisplayedUserShareMicropaise() ?? 0,
+            this.config.symbol,
+          )
+        : null,
+      lastError: this.lastError,
       viewability: this.viewability.getSnapshot(),
       extensionValid: isExtensionContextValid(),
     };
@@ -173,6 +213,29 @@ export class WaitController {
     };
     window.addEventListener("popstate", reset);
     window.addEventListener("hashchange", reset);
+
+    let lastPath = window.location.pathname;
+    const onUrlChange = (): void => {
+      const path = window.location.pathname;
+      if (path === lastPath) return;
+      const prevConv = lastPath.match(/\/c\/([a-z0-9-]+)/i)?.[1];
+      const nextConv = path.match(/\/c\/([a-z0-9-]+)/i)?.[1];
+      lastPath = path;
+      if (prevConv && nextConv && prevConv !== nextConv) reset();
+      if (prevConv && !nextConv) reset();
+    };
+    const wrapHistory = (
+      method: "pushState" | "replaceState",
+    ): void => {
+      const original = history[method].bind(history);
+      history[method] = ((...args: Parameters<History["pushState"]>) => {
+        const result = original(...args);
+        onUrlChange();
+        return result;
+      }) as History["pushState"];
+    };
+    wrapHistory("pushState");
+    wrapHistory("replaceState");
   }
 
   private scheduleEval(): void {
@@ -205,9 +268,11 @@ export class WaitController {
 
       this.cycleId = this.sm.beginGeneration();
       this.generationStartedAt = Date.now();
-      this.qualifySent = false;
+      this.qualifyHandoff.reset();
+      this.qualifyCycleId = this.cycleId;
       this.session = null;
       this.ad = null;
+      this.lastError = null;
 
       void this.telemetry("wait_detected");
       void this.runSessionFlow(this.cycleId);
@@ -223,6 +288,9 @@ export class WaitController {
     if (cycle !== this.cycleId) return;
     if (!this.sm.transition("SESSION_STARTING")) return;
 
+    await new Promise((r) => setTimeout(r, 250));
+    if (cycle !== this.cycleId) return;
+
     void this.telemetry("session_started");
 
     try {
@@ -232,12 +300,14 @@ export class WaitController {
       });
       if (cycle !== this.cycleId) return;
       if (!res.ok) {
+        this.lastError = res.error || "session_start_failed";
         this.sm.transition("ERROR");
         return;
       }
 
       const payload = res.data as SessionStartResponse;
       if (!payload.success || !payload.data?.waitSessionId) {
+        this.lastError = "session_start_missing_id";
         this.sm.transition("ERROR");
         return;
       }
@@ -281,8 +351,12 @@ export class WaitController {
 
       this.sm.transition("VIEWABILITY_PENDING");
       this.attachViewability(parsed);
-    } catch {
-      if (cycle === this.cycleId) this.sm.transition("ERROR");
+    } catch (error) {
+      if (cycle === this.cycleId) {
+        this.lastError =
+          error instanceof Error ? error.message : "session_flow_exception";
+        this.sm.transition("ERROR");
+      }
     }
   }
 
@@ -293,10 +367,13 @@ export class WaitController {
     this.ui.mount(
       this.adapter!.findPreferredAdAnchor(),
       this.adapter!.findFallbackAnchor(),
+      this.adapter!.placeAd?.bind(this.adapter),
     );
 
     if (this.expandTimer) clearTimeout(this.expandTimer);
     this.expandTimer = window.setTimeout(() => {
+      const host = this.ui?.getElement();
+      if (host?.classList.contains("chatgpt-narrow-dock")) return;
       this.ui?.expandToStandard();
     }, SHELL_EXPAND_MS);
   }
@@ -307,6 +384,7 @@ export class WaitController {
       this.ui.mount(
         this.adapter!.findPreferredAdAnchor(),
         this.adapter!.findFallbackAnchor(),
+        this.adapter!.placeAd?.bind(this.adapter),
       );
     }
     this.ui.setAd(ad);
@@ -316,6 +394,8 @@ export class WaitController {
     const host = this.ui?.getElement();
     if (!host) return;
 
+    const cycle = this.cycleId;
+    this.qualifyCycleId = cycle;
     const requiredMs = Math.max(
       ad.requiredViewMs,
       (this.config.minimumQualifiedViewMs ?? 5000),
@@ -324,7 +404,10 @@ export class WaitController {
 
     this.viewability.attach(host, {
       requiredViewMs: requiredMs,
-      onThresholdMet: (ms) => void this.requestQualify(ms),
+      onThresholdMet: (ms) => {
+        this.qualifyHandoff.markThresholdReached();
+        void this.requestQualify(cycle, ms);
+      },
       onUpdate: (snap) => {
         if (snap.intersecting && snap.tabVisible) {
           void this.telemetry("ad_viewable");
@@ -333,15 +416,26 @@ export class WaitController {
     });
   }
 
-  private async requestQualify(reportedViewMs: number): Promise<void> {
-    if (this.qualifySent || !this.ad || !this.session) return;
+  private canSendQualify(cycle: number): boolean {
+    return this.qualifyHandoff.canSendQualify({
+      thresholdReached: this.viewability.hasReachedThreshold(),
+      dismissed: this.viewability.isDismissed(),
+      impressionId: this.ad?.impressionId,
+      sessionActive: Boolean(this.session),
+      cycleMatches: cycle === this.cycleId && cycle === this.qualifyCycleId,
+      minWaitElapsed:
+        Date.now() - this.generationStartedAt >=
+        this.config.minWaitSeconds * 1000,
+    });
+  }
 
-    const elapsed = Date.now() - this.generationStartedAt;
-    if (elapsed < this.config.minWaitSeconds * 1000) return;
+  private async requestQualify(
+    cycle: number,
+    reportedViewMs: number,
+  ): Promise<void> {
+    if (!this.canSendQualify(cycle)) return;
+    if (!this.ad || !this.qualifyHandoff.markQualifyAttempted()) return;
 
-    if (!this.viewability.canQualify(this.ad.requiredViewMs)) return;
-
-    this.qualifySent = true;
     this.sm.transition("QUALIFIED");
     void this.telemetry("impression_qualify_requested");
 
@@ -354,6 +448,8 @@ export class WaitController {
         },
       });
 
+      if (cycle !== this.cycleId) return;
+
       if (!res.ok) {
         void this.telemetry("settlement_failed");
         this.sm.transition("ERROR");
@@ -361,23 +457,30 @@ export class WaitController {
       }
 
       const payload = res.data as QualifyResponse;
-      if (!payload.success || !payload.data) {
+      const outcome = this.qualifyHandoff.applyServerResult(payload);
+
+      if (outcome === "rejected") {
         void this.telemetry("settlement_failed");
+        this.sm.transition("ERROR");
         return;
       }
 
       this.sm.transition("SETTLED");
       void this.telemetry("impression_settled");
 
-      if (payload.duplicate) {
+      if (outcome === "duplicate") {
         void this.telemetry("duplicate_prevented");
         return;
       }
 
       void this.telemetry("impression_qualified");
-      this.ui?.setQualified(payload.data);
+      if (this.viewability.isDismissed()) return;
+      if (this.qualifyHandoff.shouldDisplayEarning() && payload.data) {
+        this.ui?.setQualified(payload.data);
+      }
     } catch {
       void this.telemetry("settlement_failed");
+      this.sm.transition("ERROR");
     }
   }
 
@@ -387,7 +490,8 @@ export class WaitController {
     const elapsed = Date.now() - this.generationStartedAt;
     if (
       elapsed < MIN_SPONSORED_UI_DISPLAY_MS ||
-      (this.sm.getState() === "VIEWABILITY_PENDING" && !this.qualifySent)
+      (this.sm.getState() === "VIEWABILITY_PENDING" &&
+        !this.qualifyHandoff.hasQualifyBeenSent())
     ) {
       this.sm.transition("SHORT_WAIT");
       void this.telemetry("wait_short");
@@ -396,7 +500,7 @@ export class WaitController {
     }
 
     if (this.session) {
-      void sendMessage({
+      await sendMessage({
         type: "END_WAIT_SESSION",
         payload: { waitSessionId: this.session.waitSessionId },
       });
@@ -420,7 +524,7 @@ export class WaitController {
     this.ui = null;
     this.ad = null;
     this.session = null;
-    this.qualifySent = false;
+    this.qualifyHandoff.reset();
     this.sm.transition("CLEANUP");
     this.sm.reset();
   }

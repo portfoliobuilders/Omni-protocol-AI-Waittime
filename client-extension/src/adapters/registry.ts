@@ -10,6 +10,8 @@ export interface AiSiteAdapter {
   detectGenerationEnd(): boolean;
   findPreferredAdAnchor(): HTMLElement | null;
   findFallbackAnchor(): HTMLElement | null;
+  /** Site-specific mount. Return true if the host was placed. */
+  placeAd?(host: HTMLElement): boolean;
   cleanupDuplicateAds(): void;
 }
 
@@ -93,6 +95,108 @@ function findComposerAnchor(selectors: string[]): HTMLElement | null {
   return null;
 }
 
+export type ChatGptPlacementMode =
+  | "chatgpt-wide-rail"
+  | "chatgpt-medium-float"
+  | "chatgpt-narrow-dock";
+
+export function resolveChatGptPlacementMode(
+  viewportWidth: number,
+  composerRight?: number,
+): ChatGptPlacementMode {
+  if (viewportWidth >= 1280) return "chatgpt-wide-rail";
+  const gutter =
+    typeof composerRight === "number" ? viewportWidth - composerRight : 0;
+  if (viewportWidth >= 1024 || gutter >= 220) return "chatgpt-medium-float";
+  return "chatgpt-narrow-dock";
+}
+
+const chatgptResizeHandlers = new WeakMap<HTMLElement, () => void>();
+
+function applyChatGptPlacement(
+  host: HTMLElement,
+  composerSelectors: string[],
+): void {
+  host.classList.remove(
+    "omni-inline",
+    "omni-floating",
+    "omni-chatgpt-dock",
+    "omni-chatgpt-rail",
+    "chatgpt-wide-rail",
+    "chatgpt-medium-float",
+    "chatgpt-narrow-dock",
+  );
+
+  const composer = findComposerAnchor(composerSelectors);
+  const rect = composer?.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const mode = resolveChatGptPlacementMode(vw, rect?.right);
+  host.classList.add(mode);
+
+  const gap = 8;
+  const formTop = rect && rect.height > 0 ? rect.top : vh - 96;
+  let bottom = Math.max(8, Math.round(vh - formTop + gap));
+  bottom = Math.min(bottom, Math.max(8, vh - 96));
+  host.style.position = "fixed";
+  host.style.display = "block";
+  host.style.zIndex = "40";
+  host.style.bottom = `${bottom}px`;
+  host.style.top = "auto";
+  host.style.left = "";
+  host.style.right = "";
+  host.style.transform = "";
+  host.style.minHeight = "72px";
+  host.style.maxHeight = "min(240px, calc(100vh - 160px))";
+  host.style.overflow = "auto";
+  host.style.pointerEvents = "auto";
+
+  if (mode === "chatgpt-wide-rail") {
+    if (vw >= 1440) {
+      host.style.left = "calc(50% + 400px)";
+      host.style.width = "min(300px, calc(50vw - 416px))";
+    } else {
+      host.style.right = "12px";
+      host.style.width = "min(260px, calc((100vw - 768px) / 2 - 16px))";
+    }
+  } else if (mode === "chatgpt-medium-float") {
+    host.style.right = "12px";
+    host.style.width = "min(260px, calc(100vw - 24px))";
+  } else {
+    host.style.left = "50%";
+    host.style.transform = "translateX(-50%)";
+    host.style.width = "min(340px, calc(100vw - 24px))";
+  }
+
+  if (host.parentElement !== document.body) {
+    document.body.appendChild(host);
+  }
+}
+
+function placeChatGptAd(host: HTMLElement, composerSelectors: string[]): boolean {
+  applyChatGptPlacement(host, composerSelectors);
+  if (!chatgptResizeHandlers.has(host)) {
+    const onResize = (): void => {
+      if (!host.isConnected) {
+        releaseChatGptPlacement(host);
+        return;
+      }
+      applyChatGptPlacement(host, composerSelectors);
+    };
+    window.addEventListener("resize", onResize);
+    chatgptResizeHandlers.set(host, onResize);
+  }
+  return true;
+}
+
+export function releaseChatGptPlacement(host: HTMLElement): void {
+  const handler = chatgptResizeHandlers.get(host);
+  if (handler) {
+    window.removeEventListener("resize", handler);
+    chatgptResizeHandlers.delete(host);
+  }
+}
+
 function createAdapter(def: {
   id: string;
   name: string;
@@ -102,6 +206,7 @@ function createAdapter(def: {
   composerSelectors?: string[];
   extraActiveCheck?: () => boolean;
   anchorStrategy?: "composer" | "indicator";
+  adMount?: "default" | "chatgpt-adjacent";
 }): AiSiteAdapter {
   const allSelectors = [...def.generationSelectors, ...GENERIC_STOP_SELECTORS];
   const anchorStrategy = def.anchorStrategy ?? "indicator";
@@ -163,6 +268,13 @@ function createAdapter(def: {
       return main;
     },
 
+    placeAd(host: HTMLElement): boolean {
+      if (def.adMount !== "chatgpt-adjacent" || !def.composerSelectors) {
+        return false;
+      }
+      return placeChatGptAd(host, def.composerSelectors);
+    },
+
     cleanupDuplicateAds(): void {
       const nodes = document.querySelectorAll("omni-wait-ad, #omni-wait-ad-host");
       nodes.forEach((n, i) => {
@@ -182,6 +294,7 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     hostnamePatterns: ["chatgpt.com"],
     platformKey: "chatgpt.com",
     anchorStrategy: "composer",
+    adMount: "chatgpt-adjacent",
     composerSelectors: [
       "#prompt-textarea",
       '[data-testid="composer-background"]',

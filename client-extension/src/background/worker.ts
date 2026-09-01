@@ -34,14 +34,28 @@ class BackendError extends Error {
   }
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error && /aborted/i.test(error.message);
+}
+
 async function fetchWithTimeout(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(
+    () => controller.abort("timeout"),
+    REQUEST_TIMEOUT_MS,
+  );
   try {
     return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.reason === "timeout") {
+      throw new BackendError("Backend request timed out", 0);
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -51,19 +65,32 @@ async function requestJson<T>(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await fetchWithTimeout(input, init);
-  const data = (await response.json()) as T;
-  if (!response.ok) {
-    let message = `Backend responded with ${response.status}`;
-    if (typeof data === "object" && data !== null) {
-      const serverMessage = (data as Record<string, unknown>).message;
-      if (typeof serverMessage === "string" && serverMessage) {
-        message = serverMessage;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetchWithTimeout(input, init);
+      const data = (await response.json()) as T;
+      if (!response.ok) {
+        let message = `Backend responded with ${response.status}`;
+        if (typeof data === "object" && data !== null) {
+          const serverMessage = (data as Record<string, unknown>).message;
+          if (typeof serverMessage === "string" && serverMessage) {
+            message = serverMessage;
+          }
+        }
+        throw new BackendError(message, response.status);
       }
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (error instanceof BackendError) throw error;
+      if (!isAbortError(error) || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 80 * (attempt + 1)));
     }
-    throw new BackendError(message, response.status);
   }
-  return data;
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Backend request failed");
 }
 
 export async function ensureUserId(): Promise<string> {
@@ -135,19 +162,26 @@ async function handleMessage(message: BackgroundMessage): Promise<BackgroundResp
       return { ok: true, data };
     }
 
-    case "END_WAIT_SESSION":
-      return { ok: true, data: { ended: true } };
-
-    case "TRACK_AD_CLICK": {
-      await requestJson(`${API_BASE}/telemetry`, {
+    case "END_WAIT_SESSION": {
+      const waitSessionId = message.payload?.waitSessionId;
+      if (!waitSessionId) return { ok: true, data: { ended: true } };
+      await requestJson(`${API_BASE}/session/end`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId,
-          host: "ad_click",
-          event: "click",
-        }),
+        body: JSON.stringify({ userId, waitSessionId }),
       }).catch(() => undefined);
+      return { ok: true, data: { ended: true } };
+    }
+
+    case "TRACK_AD_CLICK": {
+      const impressionId = message.payload?.impressionId;
+      if (impressionId) {
+        await requestJson(`${API_BASE}/impression/click`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, impressionId }),
+        }).catch(() => undefined);
+      }
       return { ok: true, data: { tracked: true } };
     }
 

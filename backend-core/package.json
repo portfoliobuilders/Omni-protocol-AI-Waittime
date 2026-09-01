@@ -14,7 +14,8 @@
     "test:money": "tsx ../shared/money/micropaise.test.ts",
     "test:exchange": "tsx scripts/exchange-postgres-test.ts",
     "test:exchange:pg": "tsx scripts/exchange-postgres-test.ts",
-    "test:rls": "tsx scripts/rls-probe.ts"
+    "test:rls": "tsx scripts/rls-probe.ts",
+    "test:session": "tsx scripts/session-start-test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",
