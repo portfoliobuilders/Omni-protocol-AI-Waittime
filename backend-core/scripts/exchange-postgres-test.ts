@@ -6,7 +6,8 @@
  * Isolation: tests never UPDATE campaigns SET status='paused' across all
  * active rows. Paid selection is scoped to campaigns this run created.
  * House fill uses forceHouse. Leftover __omni_test_* / legacy test names
- * may be paused; the manual ChatGPT campaign is never mutated by cleanup.
+ * may be paused. An existing manual ChatGPT campaign is never mutated
+ * (status, spend, creatives, provider). Bootstrap-create only if missing.
  */
 process.env.OMNI_TEST_MODE = "true";
 
@@ -389,7 +390,11 @@ async function main(): Promise<void> {
   assert.equal(ended.ok, true);
 
   const controlAfter = await snapshotCampaign(sb, control.id);
-  assert.equal(controlAfter.status, "active", "manual control must stay active");
+  assert.equal(
+    controlAfter.status,
+    controlBefore.status,
+    "manual control status must be unchanged by the test suite",
+  );
   assert.equal(controlAfter.provider_key, controlBefore.provider_key);
   assert.equal(
     controlAfter.total_budget_micropaise,
@@ -404,7 +409,7 @@ async function main(): Promise<void> {
   await pauseTestCampaignsById(createdTestCampaignIds);
 
   const controlFinal = await snapshotCampaign(sb, control.id);
-  assert.equal(controlFinal.status, "active");
+  assert.equal(controlFinal.status, controlBefore.status);
   assert.equal(controlFinal.spent_micropaise, controlBefore.spent_micropaise);
 
   const verify = await loadManualVerify(sb, control.id);
@@ -477,65 +482,8 @@ async function ensureManualChatGptCampaign(
     return snapshotCampaign(sb, created.campaignId);
   }
 
-  const perImp = Math.max(1, Math.floor(Number(existing.cpm_micropaise) / 1000));
-  if (Number(existing.spent_micropaise) + perImp > Number(existing.total_budget_micropaise)) {
-    const created = await createFundedCampaignPg({
-      advertiserEmail: "chatgpt-live-manual@portfoliobuilders.in",
-      advertiserName: "Omni Manual ChatGPT",
-      name: MANUAL_CHATGPT_CAMPAIGN_NAME,
-      providerKey: "omni_direct",
-      cpmMicropaise: 1_000_000,
-      totalBudgetMicropaise: 50_000,
-      headline: "Omni Direct — ChatGPT",
-      body: "Funded wait-time inventory for ChatGPT live retest.",
-      ctaLabel: "Learn more",
-      ctaUrl: "https://portfoliobuilders.in",
-      status: "active",
-    });
-    return snapshotCampaign(sb, created.campaignId);
-  }
-
-  const updates: Record<string, unknown> = {};
-  if (existing.status !== "active") {
-    updates.status = "active";
-    updates.review_status = "approved";
-    updates.reviewed_at = new Date().toISOString();
-  }
-  if (String(existing.provider_key) !== "omni_direct") {
-    updates.provider_key = "omni_direct";
-  }
-  if (Number(existing.cpm_micropaise) < 1_000_000) {
-    updates.cpm_micropaise = 1_000_000;
-  }
-  if (Object.keys(updates).length > 0) {
-    const { error } = await sb
-      .from("campaigns")
-      .update(updates)
-      .eq("id", existing.id)
-      .eq("name", MANUAL_CHATGPT_CAMPAIGN_NAME);
-    if (error) throw new Error(error.message);
-  }
-
-  const { data: creative } = await sb
-    .from("creatives")
-    .select("id, status, headline, cta_url")
-    .eq("campaign_id", existing.id)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (creative && creative.status !== "active") {
-    await sb.from("creatives").update({ status: "active" }).eq("id", creative.id);
-  } else if (!creative?.headline || !creative.cta_url) {
-    await sb.from("creatives").insert({
-      campaign_id: existing.id,
-      headline: "Omni Direct — ChatGPT",
-      description: "Funded wait-time inventory for ChatGPT live retest.",
-      cta_label: "Learn more",
-      cta_url: "https://portfoliobuilders.in",
-      status: "active",
-    });
-  }
-
+  // Existing manual campaign is operator-owned. Tests must not change
+  // status, spend, budget, provider, or creatives.
   return snapshotCampaign(sb, existing.id as string);
 }
 
