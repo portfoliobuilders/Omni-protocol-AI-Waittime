@@ -12,6 +12,8 @@ export interface AiSiteAdapter {
   findFallbackAnchor(): HTMLElement | null;
   /** Site-specific mount. Return true if the host was placed. */
   placeAd?(host: HTMLElement): boolean;
+  /** Return true when a SPA path change should cancel the current wait cycle. */
+  shouldResetOnNavigation?(prevPath: string, nextPath: string): boolean;
   cleanupDuplicateAds(): void;
 }
 
@@ -197,6 +199,23 @@ export function releaseChatGptPlacement(host: HTMLElement): void {
   }
 }
 
+/** Claude conversation URLs use /chat/{id} and /new, not ChatGPT's /c/. */
+export function claudeShouldResetOnNavigation(
+  prevPath: string,
+  nextPath: string,
+): boolean {
+  if (prevPath === nextPath) return false;
+  const conv = (p: string): string | null =>
+    p.match(/\/chat\/([a-z0-9-]+)/i)?.[1] ?? null;
+  const prevConv = conv(prevPath);
+  const nextConv = conv(nextPath);
+  if (prevConv && nextConv && prevConv !== nextConv) return true;
+  if (prevConv && !nextConv) return true;
+  const isNew = (p: string): boolean => /(?:^|\/)new\/?$/i.test(p);
+  if (isNew(nextPath) || isNew(prevPath)) return true;
+  return false;
+}
+
 function createAdapter(def: {
   id: string;
   name: string;
@@ -207,6 +226,7 @@ function createAdapter(def: {
   extraActiveCheck?: () => boolean;
   anchorStrategy?: "composer" | "indicator";
   adMount?: "default" | "chatgpt-adjacent";
+  shouldResetOnNavigation?: (prevPath: string, nextPath: string) => boolean;
 }): AiSiteAdapter {
   const allSelectors = [...def.generationSelectors, ...GENERIC_STOP_SELECTORS];
   const anchorStrategy = def.anchorStrategy ?? "indicator";
@@ -275,6 +295,8 @@ function createAdapter(def: {
       return placeChatGptAd(host, def.composerSelectors);
     },
 
+    shouldResetOnNavigation: def.shouldResetOnNavigation,
+
     cleanupDuplicateAds(): void {
       const nodes = document.querySelectorAll("omni-wait-ad, #omni-wait-ad-host");
       nodes.forEach((n, i) => {
@@ -313,6 +335,7 @@ export const SITE_ADAPTERS: AiSiteAdapter[] = [
     hostnamePatterns: ["claude.ai"],
     platformKey: "claude.ai",
     anchorStrategy: "composer",
+    shouldResetOnNavigation: claudeShouldResetOnNavigation,
     composerSelectors: [
       '[data-testid="chat-input"]',
       'div[contenteditable="true"]',

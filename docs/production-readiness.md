@@ -3,10 +3,31 @@
 Engineering live-pass is not the same as public-release sign-off.
 Manual browser-lifecycle checks that cannot be executed reliably in this
 environment stay listed here until a human confirms them on a real
-Chrome profile. They do **not** block continued engineering.
+Chrome profile. They do **not** block continued product development.
 
 Do not weaken security, financial correctness, or viewability to close
 these items.
+
+## Phase 3 engineering status
+
+| Platform | Engineering status |
+|---|---|
+| ChatGPT | **ENGINEERING PASS** |
+| Claude | **CODE READY / LIVE VERIFICATION DEFERRED** |
+| Gemini | **CODE READY / LIVE VERIFICATION DEFERRED** |
+| Perplexity | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| Copilot | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| DeepSeek | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| Grok | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| Meta AI | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| Mistral | **CODE READY / LIVE VERIFICATION BACKLOG** |
+| Poe | **CODE READY / LIVE VERIFICATION BACKLOG** |
+
+Do not claim live verification where it did not occur.
+Do not market non-ChatGPT surfaces as confirmed inventory.
+
+Phase 3 engineering is complete enough to continue advertiser-side work.
+Remaining items below are a production-readiness track, not an engineering blocker.
 
 ## Shared money / privacy (already proven on ChatGPT)
 
@@ -20,10 +41,11 @@ These apply to every platform. Do not re-implement them per site.
 - [x] House inventory settles ₹0
 - [x] No prompt / response content sent to Omni
 - [x] Automated Exchange tests must not mutate the manual ChatGPT campaign
+      (status, spend, budget, provider, creatives, surfaces)
 
 ## ChatGPT (`chatgpt.com`)
 
-Engineering PASS (2026-09): generation detection, session, `omni_direct`
+**ENGINEERING PASS** (2026-09): generation detection, session, `omni_direct`
 selection, paid Sponsored card, one-card enforcement, viewability, exactly
 one qualify, Postgres settlement, 1000/600/400 split, advertiser debit,
 user ledger, no duplicate money rows, no prompt leakage, responsive
@@ -36,44 +58,47 @@ cleanup, Forward navigation cleanup, broken-logo fallback.
 | Hidden-tab physical visibility | **DEFERRED MANUAL** | Automation cannot set a real `document.visibilityState === "hidden"`. Must switch away from a real Chrome tab for 7–10s, return, and confirm `qualifySent: false` / no settlement. Not a product failure. |
 | Conversation switch | **DEFERRED MANUAL — logged-in session required** | Guest ChatGPT has no history list. Must switch between two real `/c/` (or equivalent) conversations while a card is mounted. |
 | Extension reload / stale context | **DEFERRED MANUAL** | Requires reloading the unpacked MV3 extension in the user's Chrome while a house card is active, then refreshing the AI tab. Cursor/automation cannot drive `chrome://extensions`. |
-| New Chat (true navigation) | **BLOCKED BY GUEST SESSION** | Guest New Chat opened a sheet/modal and did not change the URL. Do not treat a modal as navigation. Do not hack around authentication. Re-test when logged in. |
+| New Chat (true navigation) | **DEFERRED MANUAL — logged-in session required** | Guest New Chat opened a sheet/modal and did not change the URL. Do not treat a modal as navigation. Do not hack around authentication. |
 
 ## Claude (`claude.ai`)
 
+**CODE READY / LIVE VERIFICATION DEFERRED.** Not failed.
+
+Live engineering in this environment is blocked by login. Claude has no
+guest chat. Do not hack around authentication.
+
+SPA path-reset for `/chat/{id}` and `/new` is implemented on the Claude adapter
+(unit-tested). ChatGPT's proven `/c/` path is unchanged. This is **not** a live PASS.
+
 | Check | Status | Notes |
 |---|---|---|
-| Probe before generation | PENDING | `adapter=claude`, `platform=claude.ai`, `state=IDLE`, `extensionValid=true` |
-| Long generation (house) | PENDING | Detection, session, one house card, placement, viewability, cleanup |
-| Responsive UI | PENDING | Wide / medium / narrow |
-| Short response | PENDING | No improper settlement |
-| Dismiss | PENDING | No qualify |
-| SPA / New Chat | PENDING | No orphan card. Prefer Claude adapter + placement strategy. |
-| One paid impression | PENDING | ₹10 CPM → 1000/600/400; exactly one qualify, revenue event, user earning, advertiser debit. Use server-returned earning. No prompt content. |
+| Probe before generation | **DEFERRED MANUAL — logged-in session required** | Expected: `adapter=claude`, `platform=claude.ai`, `state=IDLE`, `extensionValid=true` |
+| Long generation (house) | **DEFERRED MANUAL — logged-in session required** | Detection, session, one house card, placement, viewability, cleanup. Manual ChatGPT campaign is surface-locked to `chatgpt.com` and must not fill Claude. |
+| Responsive UI | **DEFERRED MANUAL** | Wide / medium / narrow |
+| Short response | **DEFERRED MANUAL** | No improper settlement |
+| Dismiss | **DEFERRED MANUAL** | No qualify |
+| SPA / New Chat | **DEFERRED MANUAL — logged-in session required** | Adapter path-reset is coded; not live-proven. |
+| One paid impression | **DEFERRED MANUAL** | Use a Claude-targeted campaign. Do not reuse ChatGPT live paid inventory. ₹10 CPM → 1000/600/400. |
 | Hidden tab | DEFERRED MANUAL | Same physical-visibility gate as ChatGPT. |
 | Conversation switch | DEFERRED MANUAL | Logged-in Claude session required. |
 
 ## Gemini (`gemini.google.com`)
 
-Not started. Do not begin until Claude engineering PASS is reported.
-
-| Check | Status |
-|---|---|
-| Probe / detection / house card / placement | NOT STARTED |
-| Paid settlement regression | NOT STARTED |
-| Hidden tab | DEFERRED MANUAL (when live work starts) |
-| Conversation switch | DEFERRED MANUAL (when live work starts) |
+**CODE READY / LIVE VERIFICATION DEFERRED.** Adapter exists. No live PASS.
 
 ## Other platforms
 
-Perplexity, Copilot, DeepSeek, Grok, Meta AI, Le Chat, Poe: adapters exist
-for host matching only. No live engineering PASS. Do not market as
-confirmed inventory.
+Perplexity, Copilot, DeepSeek, Grok, Meta AI, Mistral (Le Chat), Poe:
+**CODE READY / LIVE VERIFICATION BACKLOG.** Host adapters exist. No live PASS.
 
 ## Campaign safety
 
 Manual campaign **ChatGPT live paid inventory**:
 
+- `campaign_surfaces` = `chatgpt.com` only (not eligible on `claude.ai`)
 - Do not reset `spent_micropaise`
+- Do not change CPM, budget, provider, or review status in tests
 - Automated tests must isolate via `OMNI_TEST_MODE` + `__omni_test_*` names
-- House-only live checks: keep this campaign **paused**
-- Paid ChatGPT retests: reactivate this campaign only; do not touch others
+- House-only live checks on ChatGPT: keep this campaign **paused**
+- Paid ChatGPT retests: this campaign only
+- Future Claude paid tests: create a separate Claude-targeted campaign

@@ -74,6 +74,7 @@ async function main(): Promise<void> {
   const sb = getServiceSupabase();
   const control = await ensureManualChatGptCampaign(sb, createFundedCampaignPg);
   const controlBefore = await snapshotCampaign(sb, control.id);
+  const surfacesBefore = await loadCampaignSurfaces(sb, control.id);
 
   const stamp = Date.now();
   const runId = crypto.randomUUID().slice(0, 8);
@@ -389,6 +390,48 @@ async function main(): Promise<void> {
   const ended = await endWaitSessionPg(waitStale.id, staleUser);
   assert.equal(ended.ok, true);
 
+  const { campaignId: surfId } = await createFundedCampaignPg({
+    advertiserEmail: `__omni_test_surf_${runId}@example.com`,
+    name: omniTestCampaignName(runId, "surf"),
+    providerKey: "omni_direct",
+    cpmMicropaise: 1_000_000,
+    totalBudgetMicropaise: 3_000,
+    headline: "Surface Locked",
+    body: "ChatGPT only",
+    ctaLabel: "Open",
+    ctaUrl: "https://example.com/surf",
+    status: "active",
+  });
+  createdTestCampaignIds.push(surfId);
+  const { error: surfInsErr } = await sb.from("campaign_surfaces").insert({
+    campaign_id: surfId,
+    surface: "chatgpt.com",
+  });
+  if (surfInsErr) throw new Error(surfInsErr.message);
+
+  const claudeSurfUser = `pg_surf_claude_${stamp}`;
+  const waitClaudeSurf = await startWaitSessionPg(claudeSurfUser, "claude.ai");
+  const claudeSurfAd = await createAdRequestPg({
+    waitSessionId: waitClaudeSurf.id,
+    userId: claudeSurfUser,
+    restrictToCampaignIds: [surfId],
+  });
+  assert.equal(claudeSurfAd.ok, true);
+  if (!claudeSurfAd.ok) throw new Error(claudeSurfAd.reason);
+  assert.equal(claudeSurfAd.source, "house", "chatgpt.com surface must not fill Claude");
+
+  const gptSurfUser = `pg_surf_gpt_${stamp}`;
+  const waitGptSurf = await startWaitSessionPg(gptSurfUser, "chatgpt.com");
+  const gptSurfAd = await createAdRequestPg({
+    waitSessionId: waitGptSurf.id,
+    userId: gptSurfUser,
+    restrictToCampaignIds: [surfId],
+  });
+  assert.equal(gptSurfAd.ok, true);
+  if (!gptSurfAd.ok) throw new Error(gptSurfAd.reason);
+  assert.equal(gptSurfAd.source, "paid_campaign");
+  assert.equal(gptSurfAd.campaignId, surfId);
+
   const controlAfter = await snapshotCampaign(sb, control.id);
   assert.equal(
     controlAfter.status,
@@ -411,6 +454,12 @@ async function main(): Promise<void> {
   const controlFinal = await snapshotCampaign(sb, control.id);
   assert.equal(controlFinal.status, controlBefore.status);
   assert.equal(controlFinal.spent_micropaise, controlBefore.spent_micropaise);
+  const surfacesAfter = await loadCampaignSurfaces(sb, control.id);
+  assert.deepEqual(
+    surfacesAfter,
+    surfacesBefore,
+    "manual control surfaces must be unchanged by the test suite",
+  );
 
   const verify = await loadManualVerify(sb, control.id);
 
@@ -485,6 +534,18 @@ async function ensureManualChatGptCampaign(
   // Existing manual campaign is operator-owned. Tests must not change
   // status, spend, budget, provider, or creatives.
   return snapshotCampaign(sb, existing.id as string);
+}
+
+async function loadCampaignSurfaces(
+  sb: ReturnType<typeof import("../src/exchange/supabaseClient.ts").getServiceSupabase>,
+  id: string,
+): Promise<string[]> {
+  const { data, error } = await sb
+    .from("campaign_surfaces")
+    .select("surface")
+    .eq("campaign_id", id);
+  if (error) throw new Error(error.message);
+  return (data ?? []).map((row) => String(row.surface)).sort();
 }
 
 async function snapshotCampaign(

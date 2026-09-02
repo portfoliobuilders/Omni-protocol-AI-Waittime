@@ -4,7 +4,10 @@ import { WaitStateMachine } from "../src/content/state-machine";
 import { ViewabilityTracker } from "../src/content/viewability";
 import { formatMicropaiseDisplay, truncateText } from "../src/shared/format";
 import { parseAdRequest } from "../src/shared/messages";
-import { resolveChatGptPlacementMode } from "../src/adapters/registry";
+import {
+  claudeShouldResetOnNavigation,
+  resolveChatGptPlacementMode,
+} from "../src/adapters/registry";
 import type { QualifyResult } from "../src/shared/types";
 
 const sm = new WaitStateMachine();
@@ -520,6 +523,23 @@ assert.equal(resolveChatGptPlacementMode(1024), "chatgpt-medium-float");
 assert.equal(resolveChatGptPlacementMode(900), "chatgpt-narrow-dock");
 assert.equal(resolveChatGptPlacementMode(800), "chatgpt-narrow-dock");
 assert.equal(resolveChatGptPlacementMode(900, 680), "chatgpt-medium-float");
+
+assert.equal(
+  claudeShouldResetOnNavigation("/chat/aaa", "/chat/aaa"),
+  false,
+);
+assert.equal(
+  claudeShouldResetOnNavigation("/chat/aaa", "/chat/bbb"),
+  true,
+);
+assert.equal(claudeShouldResetOnNavigation("/chat/aaa", "/new"), true);
+assert.equal(claudeShouldResetOnNavigation("/new", "/chat/aaa"), true);
+assert.equal(claudeShouldResetOnNavigation("/new", "/new"), false);
+assert.equal(
+  claudeShouldResetOnNavigation("/c/aaa", "/c/bbb"),
+  false,
+  "Claude helper must ignore ChatGPT /c/ paths",
+);
 
 {
   const parsed = parseAdRequest({

@@ -218,9 +218,14 @@ export class WaitController {
     const onUrlChange = (): void => {
       const path = window.location.pathname;
       if (path === lastPath) return;
-      const prevConv = lastPath.match(/\/c\/([a-z0-9-]+)/i)?.[1];
-      const nextConv = path.match(/\/c\/([a-z0-9-]+)/i)?.[1];
+      const prev = lastPath;
       lastPath = path;
+      if (this.adapter?.shouldResetOnNavigation) {
+        if (this.adapter.shouldResetOnNavigation(prev, path)) reset();
+        return;
+      }
+      const prevConv = prev.match(/\/c\/([a-z0-9-]+)/i)?.[1];
+      const nextConv = path.match(/\/c\/([a-z0-9-]+)/i)?.[1];
       if (prevConv && nextConv && prevConv !== nextConv) reset();
       if (prevConv && !nextConv) reset();
     };

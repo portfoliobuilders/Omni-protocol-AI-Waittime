@@ -199,10 +199,26 @@ async function settledTodayForProfile(
   return count ?? 0;
 }
 
+/** Empty campaign_surfaces = all inventory. Non-empty = only listed surfaces. */
+async function campaignAllowsSurface(
+  campaignId: string,
+  surface: string,
+): Promise<boolean> {
+  const sb = getServiceSupabase();
+  const { data, error } = await sb
+    .from("campaign_surfaces")
+    .select("surface")
+    .eq("campaign_id", campaignId);
+  if (error) return false;
+  const rows = data ?? [];
+  if (rows.length === 0) return true;
+  return rows.some((row) => String(row.surface) === surface);
+}
+
 async function pickPaidCampaign(
   profileId: string,
   preferredProvider?: string,
-  opts?: { restrictToCampaignIds?: string[] },
+  opts?: { restrictToCampaignIds?: string[]; surface?: string },
 ): Promise<(CampaignRow & { creative: CreativePayload }) | null> {
   const sb = getServiceSupabase();
   const cfg = getExchangeConfig();
@@ -243,6 +259,9 @@ async function pickPaidCampaign(
       if (c.spent_micropaise + perImp > c.total_budget_micropaise) continue;
       if (c.starts_at && c.starts_at > now) continue;
       if (c.ends_at && c.ends_at < now) continue;
+      if (opts?.surface && !(await campaignAllowsSurface(c.id, opts.surface))) {
+        continue;
+      }
 
       const todayCount = await settledTodayForProfile(c.id, profileId);
       if (todayCount >= maxPerDay) continue;
@@ -309,7 +328,7 @@ export async function createAdRequestPg(input: {
 
   const { data: session, error: sessErr } = await sb
     .from("wait_sessions")
-    .select("id, profile_id, status")
+    .select("id, profile_id, status, platform")
     .eq("id", input.waitSessionId)
     .maybeSingle();
 
@@ -323,6 +342,7 @@ export async function createAdRequestPg(input: {
     ? null
     : await pickPaidCampaign(profileId, input.preferredProvider, {
         restrictToCampaignIds: input.restrictToCampaignIds,
+        surface: typeof session.platform === "string" ? session.platform : "",
       });
 
   if (!paid) {
