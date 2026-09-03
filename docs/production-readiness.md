@@ -95,10 +95,13 @@ Perplexity, Copilot, DeepSeek, Grok, Meta AI, Mistral (Le Chat), Poe:
 
 Manual campaign **ChatGPT live paid inventory**:
 
-- `campaign_surfaces` = `chatgpt.com` only (not eligible on `claude.ai`)
-- Do not reset `spent_micropaise`
+- `campaign_surfaces` = `chatgpt.com` only
+- Eligible on `chatgpt.com` = YES
+- Eligible on `claude.ai` = NO
+- Eligible on `gemini.google.com` = NO
+- Do not reset `spent_micropaise` (live history remains 3000 after Phase 3 paid ChatGPT)
 - Do not change CPM, budget, provider, or review status in tests
 - Automated tests must isolate via `OMNI_TEST_MODE` + `__omni_test_*` names
 - House-only live checks on ChatGPT: keep this campaign **paused**
 - Paid ChatGPT retests: this campaign only
-- Future Claude paid tests: create a separate Claude-targeted campaign
+- Future Claude / Gemini paid tests: create a separate surface-targeted campaign

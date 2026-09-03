@@ -97,6 +97,7 @@ async function main(): Promise<void> {
         surfaces,
         chatgptEligible: surfaces.includes("chatgpt.com"),
         claudeEligible: surfaces.includes("claude.ai"),
+        geminiEligible: surfaces.includes("gemini.google.com"),
       },
       null,
       2,
