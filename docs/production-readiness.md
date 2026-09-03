@@ -99,7 +99,7 @@ Manual campaign **ChatGPT live paid inventory**:
 - Eligible on `chatgpt.com` = YES
 - Eligible on `claude.ai` = NO
 - Eligible on `gemini.google.com` = NO
-- Do not reset `spent_micropaise` (live history remains 3000 after Phase 3 paid ChatGPT)
+- Do not reset `spent_micropaise` (live history must stay intact; do not rewrite past settlements)
 - Do not change CPM, budget, provider, or review status in tests
 - Automated tests must isolate via `OMNI_TEST_MODE` + `__omni_test_*` names
 - House-only live checks on ChatGPT: keep this campaign **paused**

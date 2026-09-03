@@ -77,6 +77,7 @@ import {
 } from "./exchange/postgres";
 import { BUILTIN_PROVIDERS } from "./exchange/providers";
 import { assertPostgresExchangeReady } from "./exchange/supabaseClient";
+import { registerOmniAdsRoutes } from "./ads/routes";
 
 // Keep typecheck happy for admin/test helpers re-exported via routes later.
 void createFundedCampaignPg;
@@ -177,7 +178,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(
   cors({
     origin: true,
-    methods: ["GET", "POST", "PATCH", "OPTIONS"],
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -3571,6 +3572,8 @@ app.use(
     });
   },
 );
+
+registerOmniAdsRoutes(app);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.info(`[Omni Backend] Server listening on http://localhost:${PORT}`);

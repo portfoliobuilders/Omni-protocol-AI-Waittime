@@ -198,7 +198,7 @@ async function main(): Promise<void> {
   });
   createdTestCampaignIds.push(seedId);
   const seedUser = `pg_seed_${stamp}`;
-  const waitS = await startWaitSessionPg(seedUser, "claude.ai");
+  const waitS = await startWaitSessionPg(seedUser, "chatgpt.com");
   await backdateWaitSessionPg(
     waitS.id,
     new Date(Date.now() - 15_000).toISOString(),
@@ -408,6 +408,11 @@ async function main(): Promise<void> {
     surface: "chatgpt.com",
   });
   if (surfInsErr) throw new Error(surfInsErr.message);
+  const { error: surfModeErr } = await sb
+    .from("campaigns")
+    .update({ targeting_mode: "specific" })
+    .eq("id", surfId);
+  if (surfModeErr) throw new Error(surfModeErr.message);
 
   const claudeSurfUser = `pg_surf_claude_${stamp}`;
   const waitClaudeSurf = await startWaitSessionPg(claudeSurfUser, "claude.ai");

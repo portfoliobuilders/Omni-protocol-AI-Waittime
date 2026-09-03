@@ -12,7 +12,7 @@ import { getExchangeConfig } from "./config.js";
 import { getProviderPolicy, isCashPayingProvider } from "./providers.js";
 import { classifySupabaseFailure, ExchangeError } from "./errors.js";
 import { canonicalizeInventoryPlatform } from "./platforms.js";
-import { getServiceSupabase } from "./supabaseClient.js";
+import { getServiceSupabase, getSupabaseUrl } from "./supabaseClient.js";
 
 export type CreativePayload = {
   headline: string;
@@ -20,6 +20,7 @@ export type CreativePayload = {
   cta_label: string;
   cta_url: string;
   advertiser_name?: string;
+  logo_url?: string;
 };
 
 export type WaitSessionRow = {
@@ -169,6 +170,8 @@ type CampaignRow = {
   total_budget_micropaise: number;
   spent_micropaise: number;
   status: string;
+  review_status: string | null;
+  targeting_mode: string | null;
   starts_at: string | null;
   ends_at: string | null;
 };
@@ -199,10 +202,27 @@ async function settledTodayForProfile(
   return count ?? 0;
 }
 
-/** Empty campaign_surfaces = all inventory. Non-empty = only listed surfaces. */
+async function surfaceIsServingEnabled(surface: string): Promise<boolean> {
+  if (!surface) return false;
+  const sb = getServiceSupabase();
+  const { data, error } = await sb
+    .from("inventory_surfaces")
+    .select("serving_enabled")
+    .eq("surface_key", surface)
+    .maybeSingle();
+  if (error || !data) return false;
+  return data.serving_enabled === true;
+}
+
+/**
+ * Targeting:
+ * - targeting_mode=all_enabled (or no surface rows on legacy campaigns): all serving-enabled inventory
+ * - targeting_mode=specific: only listed campaign_surfaces; zero rows = nowhere
+ */
 async function campaignAllowsSurface(
   campaignId: string,
   surface: string,
+  targetingMode?: string | null,
 ): Promise<boolean> {
   const sb = getServiceSupabase();
   const { data, error } = await sb
@@ -211,8 +231,16 @@ async function campaignAllowsSurface(
     .eq("campaign_id", campaignId);
   if (error) return false;
   const rows = data ?? [];
-  if (rows.length === 0) return true;
-  return rows.some((row) => String(row.surface) === surface);
+  const mode =
+    targetingMode === "specific" || targetingMode === "all_enabled"
+      ? targetingMode
+      : rows.length === 0
+        ? "all_enabled"
+        : "specific";
+  if (mode === "specific") {
+    return rows.some((row) => String(row.surface) === surface);
+  }
+  return true;
 }
 
 async function pickPaidCampaign(
@@ -243,7 +271,7 @@ async function pickPaidCampaign(
     let query = sb
       .from("campaigns")
       .select(
-        "id, advertiser_id, provider_key, cpm_micropaise, total_budget_micropaise, spent_micropaise, status, starts_at, ends_at",
+        "id, advertiser_id, provider_key, cpm_micropaise, total_budget_micropaise, spent_micropaise, status, review_status, targeting_mode, starts_at, ends_at",
       )
       .eq("status", "active")
       .eq("provider_key", providerKey)
@@ -253,13 +281,20 @@ async function pickPaidCampaign(
 
     for (const raw of campaigns ?? []) {
       const c = raw as CampaignRow;
+      if (c.review_status !== "approved") continue;
       if (c.cpm_micropaise < cfg.minimumCpmMicropaise) continue;
       const perImp = Math.floor(c.cpm_micropaise / 1000);
       if (perImp <= 0) continue;
       if (c.spent_micropaise + perImp > c.total_budget_micropaise) continue;
       if (c.starts_at && c.starts_at > now) continue;
       if (c.ends_at && c.ends_at < now) continue;
-      if (opts?.surface && !(await campaignAllowsSurface(c.id, opts.surface))) {
+      if (opts?.surface && !(await surfaceIsServingEnabled(opts.surface))) {
+        continue;
+      }
+      if (
+        opts?.surface &&
+        !(await campaignAllowsSurface(c.id, opts.surface, c.targeting_mode))
+      ) {
         continue;
       }
 
@@ -268,7 +303,7 @@ async function pickPaidCampaign(
 
       const { data: creative } = await sb
         .from("creatives")
-        .select("headline, description, cta_label, cta_url")
+        .select("headline, description, cta_label, cta_url, advertiser_name, logo_path")
         .eq("campaign_id", c.id)
         .eq("status", "active")
         .limit(1)
@@ -282,7 +317,14 @@ async function pickPaidCampaign(
         .eq("id", c.advertiser_id)
         .maybeSingle();
       const advertiserName =
-        typeof advertiser?.name === "string" ? advertiser.name.trim() : "";
+        (typeof creative.advertiser_name === "string" &&
+          creative.advertiser_name.trim()) ||
+        (typeof advertiser?.name === "string" ? advertiser.name.trim() : "");
+      const logoPath =
+        typeof creative.logo_path === "string" ? creative.logo_path.trim() : "";
+      const logo_url = logoPath
+        ? `${getSupabaseUrl()}/storage/v1/object/public/campaign-creatives/${logoPath}`
+        : undefined;
 
       return {
         ...c,
@@ -292,6 +334,7 @@ async function pickPaidCampaign(
           cta_label: (creative.cta_label as string) ?? "Learn more",
           cta_url: creative.cta_url as string,
           advertiser_name: advertiserName || undefined,
+          logo_url,
         },
       };
     }
@@ -723,6 +766,7 @@ export async function createFundedCampaignPg(input: {
       cpm_micropaise: input.cpmMicropaise,
       total_budget_micropaise: input.totalBudgetMicropaise,
       spent_micropaise: 0,
+      targeting_mode: "all_enabled",
       review_status: status === "active" ? "approved" : "pending",
       reviewed_at: status === "active" ? new Date().toISOString() : null,
     })
@@ -1027,6 +1071,7 @@ export async function getRecentEarningsPg(
 export async function reviewCampaignPg(
   campaignId: string,
   decision: "approve" | "reject",
+  reviewedBy?: string,
 ): Promise<
   | { ok: true; status: string }
   | { ok: false; reason: "not_found" | "not_pending" }
@@ -1048,6 +1093,7 @@ export async function reviewCampaignPg(
       status,
       review_status: decision === "approve" ? "approved" : "rejected",
       reviewed_at: new Date().toISOString(),
+      reviewed_by: reviewedBy ?? null,
     })
     .eq("id", campaignId);
   if (error) return { ok: false, reason: "not_found" };

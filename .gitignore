@@ -2,6 +2,9 @@ node_modules/
 client-extension/dist/
 backend-core/dist/
 b2b-sdk/dist/
+ads-portal/dist/
+ads-portal/node_modules/
+backend-core/public/omni-ads/
 *.db
 *.db-shm
 *.db-wal
