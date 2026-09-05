@@ -870,14 +870,17 @@ export async function campaignAnalytics(ctx: OrgContext, campaignId?: string) {
 
   const { data: impressions } = await sb
     .from("impressions")
-    .select("id, campaign_id, creative_id, status, viewable_ms, wait_session_id")
+    .select("id, campaign_id, creative_id, status, viewable_ms, reported_view_ms, wait_session_id")
     .in("campaign_id", ids);
   totals.impressions = impressions?.length ?? 0;
   const qualified = (impressions ?? []).filter(
     (i) => i.status === "settled" || i.status === "qualified",
   );
   totals.qualifiedImpressions = qualified.length;
-  totals.verifiedAttentionMs = qualified.reduce((sum, i) => sum + asInt(i.viewable_ms), 0);
+  totals.verifiedAttentionMs = qualified.reduce(
+    (sum, i) => sum + asInt(i.viewable_ms ?? i.reported_view_ms),
+    0,
+  );
 
   const impressionIds = (impressions ?? []).map((i) => i.id as string);
   let clicks = 0;
@@ -908,7 +911,7 @@ export async function campaignAnalytics(ctx: OrgContext, campaignId?: string) {
     bucket.impressions += 1;
     if (imp.status === "settled" || imp.status === "qualified") {
       bucket.qualifiedImpressions += 1;
-      bucket.verifiedAttentionMs += asInt(imp.viewable_ms);
+      bucket.verifiedAttentionMs += asInt(imp.viewable_ms ?? imp.reported_view_ms);
     }
     bySurfaceMap.set(surface, bucket);
   }
@@ -951,7 +954,7 @@ export async function campaignAnalytics(ctx: OrgContext, campaignId?: string) {
     bucket.impressions += 1;
     if (imp.status === "settled" || imp.status === "qualified") {
       bucket.qualifiedImpressions += 1;
-      bucket.verifiedAttentionMs += asInt(imp.viewable_ms);
+      bucket.verifiedAttentionMs += asInt(imp.viewable_ms ?? imp.reported_view_ms);
     }
     byCreativeMap.set(cid, bucket);
   }
@@ -1007,10 +1010,59 @@ export async function platformHealth() {
     .select("id", { count: "exact", head: true })
     .eq("status", "pending");
   const inventory = await listInventory();
+  const { isPaidInventoryEnabledPg } = await import("../exchange/postgres.js");
   return {
     activeCampaigns: active ?? 0,
     pendingReview: pending ?? 0,
     pendingFunding: pendingFunding ?? 0,
+    paidInventoryEnabled: await isPaidInventoryEnabledPg(),
     liveSurfaces: inventory.filter((s) => s.servingEnabled).map((s) => s.surfaceKey),
   };
+}
+
+export async function setInventoryServing(
+  actor: AdsActor,
+  surfaceKey: string,
+  servingEnabled: boolean,
+): Promise<InventorySurface> {
+  if (!actor.isAdmin) throw new AdsAuthError("Admin only", 403);
+  const key = surfaceKey.trim();
+  if (!key) throw new AdsValidationError("surfaceKey is required");
+  const sb = getServiceSupabase();
+  const { data, error } = await sb
+    .from("inventory_surfaces")
+    .update({ serving_enabled: servingEnabled })
+    .eq("surface_key", key)
+    .select("surface_key, name, category, serving_enabled, verification_status")
+    .maybeSingle();
+  if (error || !data) throw new AdsValidationError("Unknown inventory surface");
+  await writeAudit({
+    actorProfileId: actor.profileId,
+    action: servingEnabled ? "inventory_enabled" : "inventory_disabled",
+    entityType: "inventory",
+    entityId: key,
+  });
+  return {
+    surfaceKey: data.surface_key as string,
+    name: data.name as string,
+    category: data.category as string,
+    servingEnabled: data.serving_enabled === true,
+    verificationStatus: data.verification_status as InventorySurface["verificationStatus"],
+    selectable: data.serving_enabled === true,
+  };
+}
+
+export async function setPaidInventoryKillSwitch(actor: AdsActor, enabled: boolean) {
+  if (!actor.isAdmin) throw new AdsAuthError("Admin only", 403);
+  const { setPaidInventoryEnabledPg, isPaidInventoryEnabledPg } = await import(
+    "../exchange/postgres.js"
+  );
+  await setPaidInventoryEnabledPg(enabled);
+  await writeAudit({
+    actorProfileId: actor.profileId,
+    action: enabled ? "paid_inventory_enabled" : "paid_inventory_disabled",
+    entityType: "inventory",
+    entityId: "paid_inventory_enabled",
+  });
+  return { paidInventoryEnabled: await isPaidInventoryEnabledPg() };
 }

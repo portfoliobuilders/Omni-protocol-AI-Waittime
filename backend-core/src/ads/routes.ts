@@ -18,6 +18,8 @@ import {
   requestFunding,
   resolveFunding,
   resumeCampaign,
+  setInventoryServing,
+  setPaidInventoryKillSwitch,
   submitCampaign,
   updateCampaign,
   uploadLogo,
@@ -258,6 +260,27 @@ export function registerOmniAdsRoutes(app: Express): void {
         throw new AdsValidationError("decision must be confirmed or rejected");
       }
       const result = await resolveFunding(actor, String(req.params.id), decision);
+      res.json({ success: true, data: result });
+    }),
+  );
+
+  app.post(
+    "/api/ads/admin/paid-inventory",
+    wrap(async (req, res) => {
+      const actor = await requireAdsActor(req);
+      const enabled = req.body?.enabled !== false;
+      const result = await setPaidInventoryKillSwitch(actor, enabled);
+      res.json({ success: true, data: result });
+    }),
+  );
+
+  app.post(
+    "/api/ads/admin/inventory",
+    wrap(async (req, res) => {
+      const actor = await requireAdsActor(req);
+      const surfaceKey = typeof req.body?.surfaceKey === "string" ? req.body.surfaceKey : "";
+      const servingEnabled = req.body?.servingEnabled === true;
+      const result = await setInventoryServing(actor, surfaceKey, servingEnabled);
       res.json({ success: true, data: result });
     }),
   );

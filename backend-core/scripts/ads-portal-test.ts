@@ -306,37 +306,40 @@ async function main(): Promise<void> {
   if (expAd.ok) assert.equal(expAd.source, "house", "expired cannot serve");
 
   await sb.from("inventory_surfaces").update({ serving_enabled: true }).eq("surface_key", "claude.ai");
-  const claudeOnly = await service.createCampaign(actorA, orgA, {
-    name: `__omni_test_${runId}_claude`,
-    advertiserName: "Acme A",
-    headline: "Claude only",
-    body: "x",
-    ctaLabel: "Go",
-    ctaUrl: "https://example.com/c",
-    cpmMicropaise: 1_000_000,
-    budgetMicropaise: 10_000,
-    targetingMode: "specific",
-    surfaces: ["claude.ai"],
-  });
-  await service.submitCampaign(actorA, orgA, claudeOnly.id);
-  await service.moderateCampaign(actorAdmin, claudeOnly.id, "approve");
-  const waitGptVsClaude = await startWaitSessionPg(`ads_gvc_${stamp}`, "chatgpt.com");
-  const gptVsClaude = await createAdRequestPg({
-    waitSessionId: waitGptVsClaude.id,
-    userId: `ads_gvc_${stamp}`,
-    restrictToCampaignIds: [claudeOnly.id],
-  });
-  assert.equal(gptVsClaude.ok, true);
-  if (gptVsClaude.ok) assert.equal(gptVsClaude.source, "house", "Claude-only cannot serve ChatGPT");
-  const waitClaudeOk = await startWaitSessionPg(`ads_cok_${stamp}`, "claude.ai");
-  const claudeOk = await createAdRequestPg({
-    waitSessionId: waitClaudeOk.id,
-    userId: `ads_cok_${stamp}`,
-    restrictToCampaignIds: [claudeOnly.id],
-  });
-  assert.equal(claudeOk.ok, true);
-  if (claudeOk.ok) assert.equal(claudeOk.source, "paid_campaign");
-  await sb.from("inventory_surfaces").update({ serving_enabled: false }).eq("surface_key", "claude.ai");
+  try {
+    const claudeOnly = await service.createCampaign(actorA, orgA, {
+      name: `__omni_test_${runId}_claude`,
+      advertiserName: "Acme A",
+      headline: "Claude only",
+      body: "x",
+      ctaLabel: "Go",
+      ctaUrl: "https://example.com/c",
+      cpmMicropaise: 1_000_000,
+      budgetMicropaise: 10_000,
+      targetingMode: "specific",
+      surfaces: ["claude.ai"],
+    });
+    await service.submitCampaign(actorA, orgA, claudeOnly.id);
+    await service.moderateCampaign(actorAdmin, claudeOnly.id, "approve");
+    const waitGptVsClaude = await startWaitSessionPg(`ads_gvc_${stamp}`, "chatgpt.com");
+    const gptVsClaude = await createAdRequestPg({
+      waitSessionId: waitGptVsClaude.id,
+      userId: `ads_gvc_${stamp}`,
+      restrictToCampaignIds: [claudeOnly.id],
+    });
+    assert.equal(gptVsClaude.ok, true);
+    if (gptVsClaude.ok) assert.equal(gptVsClaude.source, "house", "Claude-only cannot serve ChatGPT");
+    const waitClaudeOk = await startWaitSessionPg(`ads_cok_${stamp}`, "claude.ai");
+    const claudeOk = await createAdRequestPg({
+      waitSessionId: waitClaudeOk.id,
+      userId: `ads_cok_${stamp}`,
+      restrictToCampaignIds: [claudeOnly.id],
+    });
+    assert.equal(claudeOk.ok, true);
+    if (claudeOk.ok) assert.equal(claudeOk.source, "paid_campaign");
+  } finally {
+    await sb.from("inventory_surfaces").update({ serving_enabled: false }).eq("surface_key", "claude.ai");
+  }
 
   const emptySurf = await service.createCampaign(actorA, orgA, {
     name: `__omni_test_${runId}_empty`,

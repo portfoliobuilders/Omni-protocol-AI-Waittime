@@ -2,49 +2,44 @@
 
 [![CI](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml/badge.svg)](https://github.com/portfoliobuilders/Omni-protocol-AI-Waittime/actions/workflows/ci.yml)
 
-OmniPiggy is a Chrome extension that detects genuine AI generation wait time on supported AI sites, shows a **Sponsored Wait**, and (in later phases) settles advertiser-funded revenue **60% user / 40% Omni**.
+Omni is a **verified AI attention advertising exchange**.
 
-There is **no fixed ₹2/₹10 reward**, **no claim button**, and **no Mindful Break / breathing UX**.
+Advertiser-funded paid impression → verified wait-time viewability → atomic Postgres settlement → **60% user / 40% Omni**.
+
+There is **no fixed ₹2/₹10 reward**, **no claim button**, **no Mindful Break / breathing UX**, and **no surveys as the product**. House ads settle at ₹0.
+
+**ChatGPT is the only live-proven inventory surface.** Other adapters exist in code; they are not verified until a human live-test passes.
 
 ## Product map
 
 | Product | Role |
 |---------|------|
-| **OmniPiggy** | Consumer Chrome / AI extension |
-| **Omni Ads** | Advertiser platform |
-| **Omni Monetize** | Publisher / developer SDK |
-| **Omni Exchange** | Auction, settlement, attribution (Supabase-backed) |
+| **OmniPiggy** | Consumer Chrome extension (sponsored wait) |
+| **Omni Ads** | Advertiser portal (`ads-portal/`, served at `/advertise`) |
+| **Omni Exchange** | Postgres settlement, wallets, campaign serving |
 
-## Phase 1 status
+## Architecture (canonical)
 
-- Supabase foundation schema + RLS live under `supabase/`
-- Integer **micropaise** accounting utilities under `shared/money/`
-- Railway production URLs removed from extension / SDK defaults
-- Legacy SQLite Express backend remains for local CI + historical migration only
+- **Supabase Postgres** is the only production financial ledger (micropaise integers).
+- The browser never calculates or requests a payout amount.
+- Extension money calls: content script → `chrome.runtime.sendMessage` → background worker → API.
+- SQLite (`backend-core`, `omni-ledger.db`) is **legacy only**: migration tooling and historical tests. Consumer SQLite money/ad/survey routes return **410**.
+- Pilot advertiser funding is **manual admin credit**. There is no Stripe/Razorpay in this phase.
 
 ## Environment
 
-Copy `.env.example` — placeholders only:
+Copy `.env.example` to `backend-core/.env`. Required to boot:
 
-```bash
+```
 SUPABASE_URL=
-SUPABASE_PUBLISHABLE_KEY=
-OMNI_API_BASE=http://localhost:3001
+SUPABASE_SERVICE_ROLE_KEY=
 ```
 
-Never put service-role keys in the extension.
+Never put the service-role key in the extension.
 
-### Supabase CLI (you run these — credentials are yours)
+Local stack: `npx supabase start` (Docker required). See `supabase/README.md`.
 
-```bash
-supabase login
-supabase link --project-ref <PROJECT_REF>
-supabase db push
-```
-
-See `supabase/README.md`.
-
-## Run the legacy local backend (SQLite — migration bridge)
+## Run the Exchange API
 
 ```bash
 cd backend-core
@@ -52,7 +47,17 @@ npm install
 npm run dev
 ```
 
-Listens on **http://localhost:3001**. Ledger file: `omni-ledger.db` (not production destination).
+Listens on **http://localhost:3001**. Postgres must be configured; the process refuses to start without it.
+
+## Advertiser portal (Omni Ads)
+
+```bash
+cd ads-portal
+npm install
+npm run build
+```
+
+Source lives in `ads-portal/src`. `ads-portal/dist` is a build artifact, not the source of truth.
 
 ## Build & load the extension
 
@@ -69,51 +74,31 @@ npm run build
 
 **IMPORTANT:** After every extension reload, refresh every open AI tab.
 
-## Money utilities
-
-```bash
-cd backend-core
-npm run test:money
-```
-
-Verifies ₹10 CPM → 1000 micropaise/impression → 600 / 400 split.
-
-## SQLite → Supabase migration (dry-run)
-
-```bash
-npx tsx scripts/migrate-sqlite-to-supabase.ts --dry-run
-```
-
-Refuse test DBs; no secrets committed. Execute mode requires your service-role env (see script help).
-
-## API (legacy local)
-
-| Method | Path | Notes |
-|--------|------|-------|
-| `GET` | `/health` | Liveness |
-| `GET` | `/api/v1/config` | Platform config (share bps, min wait) |
-| `POST` | `/api/v1/session/start` | Server wait session |
-| `POST` | `/api/v1/yield` | **Deprecated** fixed-reward path (smoke only) |
-| `GET` | `/api/v1/balance/:userId` | Wallet balance |
-
-## Testing
+## Tests
 
 ```bash
 cd backend-core
 npm run typecheck
+npm run test:money
+npm run test:targeting
+npm run test:exchange:pg   # local Supabase; never mutates ChatGPT live paid inventory
+npm run test:ads           # local Supabase; Omni Ads lifecycle
+
+cd ../client-extension
+npm run typecheck
+npm run test:unit
 npm run build
-npm run smoke          # against local server
-
-cd ../client-extension && npm run build
-cd ../b2b-sdk && npm run build
 ```
 
-```bash
-SMOKE_URL=http://localhost:3001 SMOKE_ADMIN_KEY=your-admin-key npm run smoke
-```
+Do **not** reset the production campaign named `ChatGPT live paid inventory`.
+
+## Human live tests
+
+See `docs/human-live-test-matrix.md` and `docs/production-readiness.md`. Hidden-tab, conversation-switch, extension-reload, and Claude/Gemini paid live checks require a human Chrome session.
 
 ## Troubleshooting
 
 - **Port 3001 in use** — stop the other Node process, then `npm run dev` again.
 - **"Extension context invalidated"** — reload the extension, then refresh AI tabs.
-- **Popup shows API offline** — start `backend-core` on localhost:3001.
+- **Popup shows API offline** — start `backend-core` with a valid Supabase `.env`.
+- **Docker / supabase status fails** — start Docker Desktop, then `npx supabase start`.

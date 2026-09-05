@@ -29,6 +29,22 @@ Do not market non-ChatGPT surfaces as confirmed inventory.
 Phase 3 engineering is complete enough to continue advertiser-side work.
 Remaining items below are a production-readiness track, not an engineering blocker.
 
+Private-pilot target is **not** public Chrome Web Store launch.
+
+Pilot safety controls (code):
+
+- Global paid-inventory kill switch: `POST /api/v1/admin/paid-inventory` and Omni Ads admin
+- Platform sponsored-wait kill: `POST /api/v1/admin/platforms/:id/sponsored-wait`
+- Surface serving kill: `inventory_surfaces.serving_enabled` (admin inventory toggle)
+- Campaign pause / emergency_pause
+- Budget exhaustion → house fallback
+- Frequency cap: max settled impressions per campaign/user/day
+- Duplicate qualification protection
+- Backend failure → fail silent / house
+- House ads = ₹0
+
+Human checklist: `docs/human-live-test-matrix.md`.
+
 ## Shared money / privacy (already proven on ChatGPT)
 
 These apply to every platform. Do not re-implement them per site.

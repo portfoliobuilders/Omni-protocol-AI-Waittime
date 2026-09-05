@@ -155,6 +155,9 @@ export function CampaignNewPage() {
               />
               All currently enabled inventory
             </label>
+            <p className="text-sm text-ink/60">
+              Only LIVE VERIFIED surfaces can be selected. ChatGPT is currently the only live-proven inventory.
+            </p>
             {[...grouped.entries()].map(([cat, rows]) => (
               <div key={cat} className="pt-4">
                 <p className="text-xs uppercase tracking-[0.14em] text-ink/50">{cat.replace("_", " ")}</p>

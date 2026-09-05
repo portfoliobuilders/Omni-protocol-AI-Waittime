@@ -13,27 +13,18 @@ import {
   createPartner,
   DuplicateTransactionError,
   EARNER_SHARE,
-  getActiveAd,
   getAdStats,
-  getBalance,
-  getCampaignStats,
   getLedgerStats,
-  getNextSurveyQuestion,
   getOrCreateAdvertiser,
   getPartnerByKey,
   getPartnerStats,
   getRecentTransactions,
   getRedemptions,
-  getServableCampaign,
   getSurveyResults,
-  getTransactions,
   listTopupRequests,
   pauseAdvertiserCampaign,
   PLATFORM_SHARE,
   POOL_SHARE,
-  recordAdEvent,
-  recordCampaignClick,
-  recordCampaignImpression,
   requestCampaignTopup,
   resetLedger,
   resolveRedemption,
@@ -64,6 +55,7 @@ import {
   getPlatformHealthPg,
   getRecentEarningsPg,
   getWalletPg,
+  isPaidInventoryEnabledPg,
   listCampaignsAdminPg,
   listUserRedemptionsPg,
   qualifyAndSettlePg,
@@ -72,6 +64,7 @@ import {
   requestRedemptionPg,
   reviewCampaignPg,
   setCampaignProviderPg,
+  setPaidInventoryEnabledPg,
   setSponsoredWaitEnabledPg,
   startWaitSessionPg,
 } from "./exchange/postgres";
@@ -123,13 +116,6 @@ const ADMIN_KEY = process.env.OMNI_ADMIN_KEY;
 interface SessionStartRequestBody {
   userId?: unknown;
   partnerKey?: unknown;
-}
-
-interface AdEventRequestBody {
-  adId?: unknown;
-  userId?: unknown;
-  event?: unknown;
-  campaignId?: unknown;
 }
 
 interface CreateCampaignRequestBody {
@@ -670,30 +656,12 @@ app.post("/api/v1/session/end", safeRoute(async (req, res) => {
   });
 }));
 
-app.get("/api/v1/survey/next/:userId", (req: Request, res: Response) => {
-  try {
-    const userId = parseUserId(req.params.userId);
-    const question = getNextSurveyQuestion(userId);
-
-    res.status(200).json({
-      success: true,
-      data: { question },
-    });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Survey] Unexpected error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
-  }
+app.get("/api/v1/survey/next/:userId", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message: "Surveys are not part of the Omni attention exchange. This endpoint is retired.",
+  });
 });
 
 
@@ -872,149 +840,40 @@ app.post("/api/v1/yield", (_req: Request, res: Response) => {
   });
 });
 
-app.get("/api/v1/balance/:userId", safeRoute((req, res) => {
-  const userId = parseUserId(req.params.userId);
-  res.status(200).json({
-    success: true,
-    data: {
-      userId,
-      balance: getBalance(userId),
-    },
+app.get("/api/v1/balance/:userId", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message:
+      "SQLite balance is retired. Use GET /api/v1/exchange/wallet/:userId (Postgres).",
   });
-}));
+});
 
-app.get("/api/v1/transactions/:userId", safeRoute((req, res) => {
-  const userId = parseUserId(req.params.userId);
-  const limit = Math.min(Number(req.query.limit) || 25, 100);
-  res.status(200).json({
-    success: true,
-    data: {
-      userId,
-      transactions: getTransactions(userId, limit),
-    },
+app.get("/api/v1/transactions/:userId", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message:
+      "SQLite transactions are retired. Use GET /api/v1/exchange/recent/:userId (Postgres).",
   });
-}));
+});
 
-app.get("/api/v1/ad/next", safeRoute((_req, res) => {
-  const campaign = getServableCampaign();
-  if (campaign) {
-    res.status(200).json({
-      success: true,
-      data: {
-        ad: {
-          id: campaign.id,
-          headline: campaign.headline,
-          body: campaign.body,
-          cta_label: campaign.cta_label,
-          cta_url: campaign.cta_url,
-        },
-        source: "campaign",
-        campaignId: campaign.id,
-      },
-    });
-    return;
-  }
-
-  res.status(200).json({
-    success: true,
-    data: {
-      ad: getActiveAd(),
-      source: "house",
-    },
+app.get("/api/v1/ad/next", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message:
+      "SQLite ad serving is retired. Use POST /api/v1/ad/request after a wait session.",
   });
-}));
+});
 
-app.post("/api/v1/ad/event", (req: Request, res: Response) => {
-  try {
-    const body = req.body as AdEventRequestBody;
-
-    const userId = parseUserId(body.userId);
-
-    const event =
-      typeof body.event === "string" ? body.event.trim() : "";
-
-    if (event !== "impression" && event !== "click") {
-      throw new ValidationError("event must be 'impression' or 'click'.");
-    }
-
-    const campaignIdRaw = body.campaignId;
-    const campaignId =
-      typeof campaignIdRaw === "number"
-        ? campaignIdRaw
-        : typeof campaignIdRaw === "string"
-          ? Number(campaignIdRaw)
-          : NaN;
-
-    if (Number.isInteger(campaignId) && campaignId > 0) {
-      if (event === "impression") {
-        const result = recordCampaignImpression(campaignId, userId);
-        if (!result.ok) {
-          res.status(400).json({
-            success: false,
-            message: "Invalid campaign impression.",
-          });
-          return;
-        }
-        res.status(200).json({
-          success: true,
-          data: {
-            spent_paise: result.spent_paise,
-            status: result.status,
-            revenue: result.revenue,
-          },
-        });
-        return;
-      }
-
-      const clickResult = recordCampaignClick(campaignId, userId);
-      if (!clickResult.ok) {
-        res.status(400).json({
-          success: false,
-          message: "Invalid campaign click.",
-        });
-        return;
-      }
-      res.status(200).json({ success: true });
-      return;
-    }
-
-    const adId =
-      typeof body.adId === "number"
-        ? body.adId
-        : typeof body.adId === "string"
-          ? Number(body.adId)
-          : NaN;
-
-    if (!Number.isInteger(adId) || adId <= 0) {
-      throw new ValidationError("adId must be a positive integer.");
-    }
-
-    const result = recordAdEvent(adId, userId, event);
-
-    if (!result.ok) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid ad event.",
-      });
-      return;
-    }
-
-    res.status(200).json({ success: true });
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-      return;
-    }
-
-    console.error("[Omni Ad] Unexpected error", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error.",
-    });
-  }
+app.post("/api/v1/ad/event", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message:
+      "SQLite ad events are retired. Qualification and clicks go through Postgres impression routes.",
+  });
 });
 
 app.post("/api/v1/campaigns", safeRoute(async (req, res) => {
@@ -1115,29 +974,21 @@ app.post("/api/v1/campaigns", safeRoute(async (req, res) => {
   });
 }));
 
-app.get("/api/v1/campaigns/stats", safeRoute((req, res) => {
-  const auth = requireAdvertiser(req, res);
-  if (!auth) {
-    return;
-  }
-
-  res.status(200).json({
-    success: true,
-    data: { campaigns: getCampaignStats(auth.email) },
+app.get("/api/v1/campaigns/stats", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message: "SQLite advertiser stats are retired. Use Omni Ads at /advertise.",
   });
-}));
+});
 
-app.get("/api/v1/advertiser/campaigns", safeRoute((req, res) => {
-  const auth = requireAdvertiser(req, res);
-  if (!auth) {
-    return;
-  }
-
-  res.status(200).json({
-    success: true,
-    data: { campaigns: getCampaignStats(auth.email) },
+app.get("/api/v1/advertiser/campaigns", (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    deprecated: true,
+    message: "SQLite advertiser campaigns are retired. Use Omni Ads at /advertise.",
   });
-}));
+});
 
 app.post(
   "/api/v1/advertiser/campaigns/:id/pause",
@@ -1364,6 +1215,25 @@ app.post(
     }
     await setSponsoredWaitEnabledPg(id, enabled);
     res.status(200).json({ success: true, data: { id, sponsoredWaitEnabled: enabled } });
+  }),
+);
+
+app.get(
+  "/api/v1/admin/paid-inventory",
+  requireAdminKey,
+  safeRoute(async (_req, res) => {
+    const enabled = await isPaidInventoryEnabledPg();
+    res.status(200).json({ success: true, data: { paidInventoryEnabled: enabled } });
+  }),
+);
+
+app.post(
+  "/api/v1/admin/paid-inventory",
+  requireAdminKey,
+  safeRoute(async (req, res) => {
+    const enabled = req.body?.enabled !== false;
+    await setPaidInventoryEnabledPg(enabled);
+    res.status(200).json({ success: true, data: { paidInventoryEnabled: enabled } });
   }),
 );
 

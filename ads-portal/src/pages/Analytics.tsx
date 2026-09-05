@@ -28,7 +28,7 @@ export function AnalyticsPage() {
     return (
       <div>
         <h1 className="text-4xl font-semibold">Analytics</h1>
-        <p className="mt-4 max-w-md text-sm text-ink/60">No verified attention yet. Numbers appear after qualified impressions settle in Postgres.</p>
+        <p className="mt-4 max-w-md text-sm text-ink/60">No settled events yet. Spend, impressions, and qualification rates appear from real Postgres rows — not demo data.</p>
       </div>
     );
   }
@@ -37,7 +37,7 @@ export function AnalyticsPage() {
       <h1 className="text-4xl font-semibold">Analytics</h1>
       <div className="mt-8 grid gap-4 text-sm md:grid-cols-2">
         <p>Qualified impressions {data.totals.qualifiedImpressions}</p>
-        <p>Verified attention {data.totals.verifiedAttentionSeconds}s</p>
+        <p>Qualified view time {data.totals.verifiedAttentionSeconds}s (from reported view ms)</p>
         <p>Average {data.totals.averageVerifiedAttentionSeconds}s</p>
         <p>Clicks {data.totals.clicks} · CTR {formatPct(data.totals.ctr)}</p>
         <p>Spend {formatInrFromMicropaise(data.totals.spendMicropaise)}</p>

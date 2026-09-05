@@ -18,5 +18,7 @@ supabase/.branches/
 supabase/.temp/
 .agents/
 skills-lock.json
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 .DS_Store

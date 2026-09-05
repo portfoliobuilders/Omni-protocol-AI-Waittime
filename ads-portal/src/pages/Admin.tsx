@@ -7,7 +7,13 @@ type Queue = {
   campaigns: Array<{ id: string; name: string; status: string; review_status: string; spent_micropaise: number }>;
   funding: Array<{ id: string; amount_micropaise: number; status: string }>;
   advertisers: Array<{ id: string; name: string; status: string }>;
-  health: { activeCampaigns: number; pendingReview: number; pendingFunding: number; liveSurfaces: string[] };
+  health: {
+    activeCampaigns: number;
+    pendingReview: number;
+    pendingFunding: number;
+    paidInventoryEnabled?: boolean;
+    liveSurfaces: string[];
+  };
 };
 
 export function AdminPage() {
@@ -29,7 +35,23 @@ export function AdminPage() {
     <div>
       <h1 className="text-4xl font-semibold">Admin</h1>
       <p className="mt-2 text-sm text-ink/60">
-        {data.health.activeCampaigns} active · {data.health.pendingReview} pending review · live {data.health.liveSurfaces.join(", ")}
+        {data.health.activeCampaigns} active · {data.health.pendingReview} pending review · live {data.health.liveSurfaces.join(", ") || "none"}
+      </p>
+      <p className="mt-2 text-sm">
+        Paid inventory is {data.health.paidInventoryEnabled === false ? "OFF (house only)" : "ON"}.
+        {" "}
+        <button
+          type="button"
+          className="underline"
+          onClick={() => {
+            void api("/api/ads/admin/paid-inventory", session, {
+              method: "POST",
+              body: JSON.stringify({ enabled: data.health.paidInventoryEnabled === false }),
+            }).then(load);
+          }}
+        >
+          {data.health.paidInventoryEnabled === false ? "Enable paid inventory" : "Kill paid inventory"}
+        </button>
       </p>
       <label className="mt-6 block text-sm">
         Review notes

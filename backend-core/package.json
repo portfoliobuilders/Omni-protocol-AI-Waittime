@@ -16,7 +16,8 @@
     "test:exchange:pg": "tsx scripts/exchange-postgres-test.ts",
     "test:rls": "tsx scripts/rls-probe.ts",
     "test:session": "tsx scripts/session-start-test.ts",
-    "test:ads": "tsx scripts/ads-portal-test.ts"
+    "test:ads": "tsx scripts/ads-portal-test.ts",
+    "test:targeting": "tsx scripts/targeting-test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",

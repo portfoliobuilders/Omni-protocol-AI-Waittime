@@ -1,0 +1,33 @@
+---
+description: Omni AI Attention Exchange — money, privacy, and architecture invariants
+alwaysApply: true
+---
+
+# Omni = verified AI attention advertising exchange
+
+Supabase Postgres is the **only production money ledger**. SQLite may remain only for legacy compatibility, migration tooling, and isolated historical tests. New advertiser funding, campaign spend, impression settlement, user earnings, and redemption MUST NOT write financial truth into SQLite.
+
+## Economics
+
+- 60% user / 40% Omni
+- House inventory = ₹0
+- One wait = one ad = max one settlement
+- Advertiser-funded earnings only
+- Integer BIGINT micropaise — never floating-point currency accounting
+
+## Hard invariants
+
+- Browser cannot send arbitrary payout values. Reject `rewardAmount` / `userShare` / `grossRevenue` from clients.
+- Financial HTTP: content script → `chrome.runtime.sendMessage` → background worker → API.
+- Settlement is Postgres-atomic (`settle_impression`). Duplicate qualification cannot debit twice.
+- Hidden tabs, dismissed ads, short waits, failed qualification, and stale/expired sessions cannot settle paid money.
+- Never read prompts, answers, conversation text, or browsing history. Campaign targeting is inventory/surface only.
+- Never reset or reuse production campaign **ChatGPT live paid inventory** (`spent_micropaise` history is sacred).
+
+## Inventory honesty
+
+ChatGPT is the only live-proven surface. Code adapters for Claude/Gemini/etc. are not “verified inventory.” A Claude-restricted campaign must never serve on ChatGPT (and vice versa).
+
+## Out of scope unless explicitly commanded
+
+IDE extensions, RTB, AdMob/AdSense, surveys as product, crypto, referrals, publisher marketplace v2.

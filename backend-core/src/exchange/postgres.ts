@@ -13,6 +13,7 @@ import { getProviderPolicy, isCashPayingProvider } from "./providers.js";
 import { classifySupabaseFailure, ExchangeError } from "./errors.js";
 import { canonicalizeInventoryPlatform } from "./platforms.js";
 import { getServiceSupabase, getSupabaseUrl } from "./supabaseClient.js";
+import { campaignAllowsInventorySurface } from "./targeting.js";
 
 export type CreativePayload = {
   headline: string;
@@ -216,8 +217,9 @@ async function surfaceIsServingEnabled(surface: string): Promise<boolean> {
 
 /**
  * Targeting:
- * - targeting_mode=all_enabled (or no surface rows on legacy campaigns): all serving-enabled inventory
- * - targeting_mode=specific: only listed campaign_surfaces; zero rows = nowhere
+ * - listed campaign_surfaces always restrict (even if targeting_mode was left all_enabled)
+ * - targeting_mode=specific + zero rows = nowhere
+ * - targeting_mode=all_enabled + no rows = all serving-enabled inventory
  */
 async function campaignAllowsSurface(
   campaignId: string,
@@ -230,17 +232,11 @@ async function campaignAllowsSurface(
     .select("surface")
     .eq("campaign_id", campaignId);
   if (error) return false;
-  const rows = data ?? [];
-  const mode =
-    targetingMode === "specific" || targetingMode === "all_enabled"
-      ? targetingMode
-      : rows.length === 0
-        ? "all_enabled"
-        : "specific";
-  if (mode === "specific") {
-    return rows.some((row) => String(row.surface) === surface);
-  }
-  return true;
+  return campaignAllowsInventorySurface({
+    targetingMode,
+    listedSurfaces: (data ?? []).map((row) => String(row.surface)),
+    requestSurface: surface,
+  });
 }
 
 async function pickPaidCampaign(
@@ -381,12 +377,14 @@ export async function createAdRequestPg(input: {
 
   const { installationId } = await ensureProfileAndInstallation(input.userId);
   await expireStaleExchangeRowsPg().catch(() => undefined);
-  const paid = input.forceHouse
-    ? null
-    : await pickPaidCampaign(profileId, input.preferredProvider, {
-        restrictToCampaignIds: input.restrictToCampaignIds,
-        surface: typeof session.platform === "string" ? session.platform : "",
-      });
+  const paidInventoryEnabled = await isPaidInventoryEnabledPg();
+  const paid =
+    input.forceHouse || !paidInventoryEnabled
+      ? null
+      : await pickPaidCampaign(profileId, input.preferredProvider, {
+          restrictToCampaignIds: input.restrictToCampaignIds,
+          surface: typeof session.platform === "string" ? session.platform : "",
+        });
 
   if (!paid) {
     const { data: adReq, error: arErr } = await sb
@@ -576,6 +574,7 @@ export async function qualifyAndSettlePg(input: {
     .from("impressions")
     .update({
       reported_view_ms: reported,
+      viewable_ms: reported,
       status: "qualified",
       qualified_at: new Date().toISOString(),
     })
@@ -1229,6 +1228,34 @@ export async function getInventoryPlatformFlagsPg(): Promise<PlatformFlagMap> {
     return value as PlatformFlagMap;
   }
   return {};
+}
+
+export async function isPaidInventoryEnabledPg(): Promise<boolean> {
+  const sb = getServiceSupabase();
+  const { data } = await sb
+    .from("app_config")
+    .select("value")
+    .eq("key", "paid_inventory_enabled")
+    .maybeSingle();
+  const value = data?.value;
+  if (value === false || value === "false") return false;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const rec = value as { enabled?: unknown };
+    if (rec.enabled === false) return false;
+  }
+  return true;
+}
+
+export async function setPaidInventoryEnabledPg(enabled: boolean): Promise<void> {
+  const sb = getServiceSupabase();
+  await sb.from("app_config").upsert(
+    {
+      key: "paid_inventory_enabled",
+      value: enabled,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "key" },
+  );
 }
 
 export async function setSponsoredWaitEnabledPg(
