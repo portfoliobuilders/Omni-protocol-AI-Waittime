@@ -32,6 +32,7 @@ async function main(): Promise<void> {
     createAdRequestPg,
     startWaitSessionPg,
     createFundedCampaignPg,
+    setPaidInventoryEnabledPg,
   } = await import("../src/exchange/postgres.ts");
   const service = await import("../src/ads/service.ts");
   const { AdsValidationError, isHttpsUrl } = await import("../src/ads/validate.ts");
@@ -385,6 +386,78 @@ async function main(): Promise<void> {
   });
   assert.equal(exhAd.ok, true);
   if (exhAd.ok) assert.equal(exhAd.source, "house", "budget exhausted cannot serve");
+
+  await setPaidInventoryEnabledPg(false);
+  try {
+    const waitKill = await startWaitSessionPg(`ads_kill_${stamp}`, "chatgpt.com");
+    const killAd = await createAdRequestPg({
+      waitSessionId: waitKill.id,
+      userId: `ads_kill_${stamp}`,
+      restrictToCampaignIds: [draft.id],
+    });
+    assert.equal(killAd.ok, true);
+    if (killAd.ok) {
+      assert.equal(killAd.source, "house", "paid kill switch must not serve paid inventory");
+    }
+  } finally {
+    await setPaidInventoryEnabledPg(true);
+  }
+  const waitKillOn = await startWaitSessionPg(`ads_killon_${stamp}`, "chatgpt.com");
+  const killOnAd = await createAdRequestPg({
+    waitSessionId: waitKillOn.id,
+    userId: `ads_killon_${stamp}`,
+    restrictToCampaignIds: [draft.id],
+  });
+  assert.equal(killOnAd.ok, true);
+  if (killOnAd.ok) {
+    assert.equal(killOnAd.source, "paid_campaign", "paid inventory resumes after kill switch re-enabled");
+  }
+
+  await sb
+    .from("inventory_surfaces")
+    .update({ serving_enabled: true })
+    .in("surface_key", ["gemini.google.com", "claude.ai"]);
+  try {
+    const geminiOnly = await service.createCampaign(actorA, orgA, {
+      name: `__omni_test_${runId}_gemini`,
+      advertiserName: "Acme A",
+      headline: "Gemini only",
+      body: "x",
+      ctaLabel: "Go",
+      ctaUrl: "https://example.com/g",
+      cpmMicropaise: 1_000_000,
+      budgetMicropaise: 10_000,
+      targetingMode: "specific",
+      surfaces: ["gemini.google.com"],
+    });
+    await service.submitCampaign(actorA, orgA, geminiOnly.id);
+    await service.moderateCampaign(actorAdmin, geminiOnly.id, "approve");
+    const waitGemClaude = await startWaitSessionPg(`ads_gcl_${stamp}`, "claude.ai");
+    const gemOnClaude = await createAdRequestPg({
+      waitSessionId: waitGemClaude.id,
+      userId: `ads_gcl_${stamp}`,
+      restrictToCampaignIds: [geminiOnly.id],
+    });
+    assert.equal(gemOnClaude.ok, true);
+    if (gemOnClaude.ok) {
+      assert.equal(gemOnClaude.source, "house", "Gemini-only must not serve Claude");
+    }
+    const waitGemOk = await startWaitSessionPg(`ads_gok_${stamp}`, "gemini.google.com");
+    const gemOk = await createAdRequestPg({
+      waitSessionId: waitGemOk.id,
+      userId: `ads_gok_${stamp}`,
+      restrictToCampaignIds: [geminiOnly.id],
+    });
+    assert.equal(gemOk.ok, true);
+    if (gemOk.ok) {
+      assert.equal(gemOk.source, "paid_campaign", "Gemini-only may serve Gemini when enabled");
+    }
+  } finally {
+    await sb
+      .from("inventory_surfaces")
+      .update({ serving_enabled: false })
+      .in("surface_key", ["gemini.google.com", "claude.ai"]);
+  }
 
   const metrics = await service.campaignAnalytics(orgA, draft.id);
   assert.equal(typeof metrics.totals.qualifiedImpressions, "number");
